@@ -2569,42 +2569,36 @@ KJ_TEST("unconfirmed setAlarm failure still breaks output gate") {
   KJ_EXPECT_THROW_MESSAGE("alarm commit failed", promise.wait(test.ws));
 }
 
-KJ_TEST("sync() throws after critical error in explicit transaction") {
-  ActorSqliteTest test({.monitorOutputGate = false});
-  auto heapLimit = [&]() {
-    auto row = test.db.run("PRAGMA hard_heap_limit");
-    return row.getInt(0);
-  }();
-  KJ_DBG(heapLimit);
-  KJ_DEFER(sqlite3_hard_heap_limit64(heapLimit););
+// Drives `test` into the broken state through SqliteDatabase's critical-error path: a write that
+// fails with SQLITE_NOMEM inside `txn` makes SQLite auto-rollback the transaction, which invokes
+// ActorSqlite::onCriticalError(). The global heap limit is restored before returning so that
+// connections opened later are unaffected.
+void breakViaCriticalError(ActorSqliteTest& test, ActorCacheInterface::Transaction& txn) {
+  auto heapLimit = test.db.run("PRAGMA hard_heap_limit").getInt64(0);
+  KJ_DEFER(sqlite3_hard_heap_limit64(heapLimit));
 
-  // Start an explicit transaction
-  auto txn = test.startTransaction();
+  test.db.run("PRAGMA hard_heap_limit=8192");  // 8KB limit
 
-  // Do a write within the transaction
-  txn->put(kj::str("foo"), kj::heapArray("bar"_kj.asBytes()), {}, nullptr);
-
-  // Trigger a critical error using SQLITE_NOMEM by setting a very low heap limit
-  // and then trying to insert a large value.
+  // A value large enough to exceed the limit. Copied once more to convert Array<byte> to
+  // Array<const byte>.
+  auto largeData = kj::heapArray<byte>(50000, 'X');
   try {
-    // Set SQLite's memory limit very low to trigger SQLITE_NOMEM
-    test.db.run("PRAGMA hard_heap_limit=8192");  // 8KB limit
-
-    // Create data that will exceed the memory limit
-    auto largeData = kj::heapArray<byte>(50000, 'X');  // 50KB
-
-    // This should trigger SQLITE_NOMEM, causing SQLite to auto-rollback the transaction,
-    // which will trigger the critical error handler.
-    //
-    // We have to copy it again in order to convert to a Array<const byte> from an Array<byte>.
-    txn->put(kj::str("large_key"), kj::heapArray<const byte>(largeData.asBytes()), /*options=*/{},
-        nullptr);
+    txn.put(kj::str("large_key"), kj::heapArray<const byte>(largeData.asBytes()), {}, nullptr);
     KJ_FAIL_ASSERT("Query should have failed with SQLITE_NOMEM");
   } catch (kj::Exception& e) {
-    // Expected: out of memory error. We catch and ignore this to continue the test.
-    KJ_ASSERT(e.getDescription().contains("SENTRY_DO"));
-    KJ_ASSERT(e.getDescription().contains("out of memory"));
+    KJ_ASSERT(e.getDescription().contains("SENTRY_DO"), e);
+    KJ_ASSERT(e.getDescription().contains("out of memory"), e);
   }
+}
+
+KJ_TEST("sync() throws after critical error in explicit transaction") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+
+  // Start an explicit transaction and do a write within it.
+  auto txn = test.startTransaction();
+  txn->put(kj::str("foo"), kj::heapArray("bar"_kj.asBytes()), {}, nullptr);
+
+  breakViaCriticalError(test, *txn);
 
   // sync() should also throw an exception because the storage is now broken
   auto syncResult = test.sync();
@@ -2615,6 +2609,112 @@ KJ_TEST("sync() throws after critical error in explicit transaction") {
   // The transaction is now in a broken state due to the critical error.
   // Attempting to commit should fail.
   KJ_EXPECT_THROW_MESSAGE("broken", txn->commit());
+}
+
+// Asserts that `test.db` has been closed. Direct use fails, and a second connection to the same
+// file can take an exclusive lock (which the closed connection's open transaction would have
+// blocked) and sees the committed write but not the uncommitted one.
+void expectDatabaseClosed(ActorSqliteTest& test) {
+  KJ_EXPECT_THROW_MESSAGE("database has been closed", test.db.run("SELECT 1"));
+
+  SqliteDatabase fresh(test.vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  fresh.run("BEGIN EXCLUSIVE");
+  KJ_EXPECT(fresh.run("SELECT count(*) FROM _cf_KV WHERE key = 'committed'").getInt(0) == 1);
+  KJ_EXPECT(fresh.run("SELECT count(*) FROM _cf_KV WHERE key = 'uncommitted'").getInt(0) == 0);
+  fresh.run("COMMIT");
+}
+
+KJ_TEST("shutdown() leaves the connection open; the owner closes it afterwards") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+
+  test.put("committed", "yes");
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Leave a second write open in an implicit transaction whose commit has not run yet.
+  test.put("uncommitted", "yes");
+
+  test.actor.shutdown(kj::none);
+
+  // Storage is broken, but shutdown() must not close the connection itself: embedders may call it
+  // from inside a SQLite callback, where closing is unsafe. The owner closes it later.
+  KJ_EXPECT_THROW_MESSAGE(ActorCache::SHUTDOWN_ERROR_MESSAGE, test.actor.getSqliteKv());
+  test.db.run("SELECT 1");
+
+  // The scheduled commit observes the shutdown and breaks the output gate with the shutdown
+  // exception rather than committing.
+  KJ_EXPECT_THROW_MESSAGE(ActorCache::SHUTDOWN_ERROR_MESSAGE, test.gate.onBroken().wait(test.ws));
+  test.pollAndExpectCalls({});
+
+  // Closing with the implicit transaction still open rolls it back and releases the file.
+  test.db.close();
+  expectDatabaseClosed(test);
+
+  // A second shutdown() on a closed database is a no-op.
+  test.actor.shutdown(kj::none);
+  KJ_EXPECT_THROW_MESSAGE(ActorCache::SHUTDOWN_ERROR_MESSAGE, test.actor.getSqliteKv());
+  expectDatabaseClosed(test);
+}
+
+KJ_TEST("shutdown() after a critical error keeps the original exception") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+
+  test.put("committed", "yes");
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  auto txn = test.startTransaction();
+  txn->put(kj::str("uncommitted"), kj::heapArray("yes"_kj.asBytes()), {}, nullptr);
+  breakViaCriticalError(test, *txn);
+  KJ_EXPECT_THROW_MESSAGE("broken.outputGateBroken", test.actor.getSqliteKv());
+
+  auto expectOriginalBrokenException = [&]() {
+    KJ_IF_SOME(e, kj::runCatchingExceptions([&]() { test.actor.getSqliteKv(); })) {
+      // The first exception wins: the shutdown exception must not replace the storage error.
+      KJ_EXPECT(e.getDescription().contains("broken.outputGateBroken"), e);
+      KJ_EXPECT(!e.getDescription().contains(ActorCache::SHUTDOWN_ERROR_MESSAGE), e);
+    } else {
+      KJ_FAIL_EXPECT("getSqliteKv() should have thrown");
+    }
+  };
+
+  // shutdown() runs after the break (the broken output gate aborts the IoContext), then the owner
+  // closes the connection.
+  test.actor.shutdown(kj::none);
+  expectOriginalBrokenException();
+  test.db.close();
+  expectDatabaseClosed(test);
+
+  test.actor.shutdown(kj::none);
+  expectOriginalBrokenException();
+}
+
+KJ_TEST("shutdown() during in-flight commit does not unschedule the persisted alarm") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+
+  // Persist an alarm at 2ms, so that the next write moves the alarm earlier and thus starts a
+  // precommit scheduling request that the commit must wait on.
+  test.setAlarm(twoMs);
+  test.pollAndExpectCalls({"scheduleRun(2ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Move the alarm earlier. The local transaction commits, then commitImpl() suspends waiting for
+  // the scheduler to confirm the 1ms request.
+  test.setAlarm(oneMs);
+  auto scheduleFulfiller = kj::mv(test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]);
+
+  // Shut down while that commit is parked.
+  test.actor.shutdown(kj::none);
+
+  // Resume the commit. Now that storage is broken, it must not consult the database's alarm state
+  // and must not issue any further scheduler requests. In particular it must not issue
+  // `scheduleRun(none)`, which would cancel the alarm that the database still persists.
+  scheduleFulfiller->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_EXPECT_THROW_MESSAGE(ActorCache::SHUTDOWN_ERROR_MESSAGE, test.gate.onBroken().wait(test.ws));
+
+  // The database still holds the 1ms alarm for the next instance to pick up.
+  SqliteDatabase fresh(test.vfs, kj::Path({"foo"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(fresh.run("SELECT value FROM _cf_METADATA WHERE key = 1").getInt64(0) ==
+      (oneMs - kj::UNIX_EPOCH) / kj::NANOSECONDS);
 }
 
 KJ_TEST("allowUnconfirmed put in explicit transaction does not block output gate") {

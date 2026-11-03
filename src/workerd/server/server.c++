@@ -5,6 +5,7 @@
 #include "server.h"
 
 #include "alarm-scheduler.h"
+#include "cluster-lock.h"
 #include "container-client.h"
 #include "pyodide.h"
 #include "workerd-api.h"
@@ -12,6 +13,7 @@
 #include <workerd/api/actor-state.h>
 #include <workerd/api/analytics-engine.capnp.h>
 #include <workerd/api/pyodide/pyodide.h>
+#include <workerd/api/restore.h>
 #include <workerd/api/trace.h>
 #include <workerd/api/worker-rpc.h>
 #include <workerd/io/access-info.h>
@@ -45,10 +47,12 @@
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
+#include <unistd.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <capnp/rpc-twoparty.h>
+#include <capnp/rpc.h>
 #include <kj/compat/http.h>
 #include <kj/compat/tls.h>
 #include <kj/compat/url.h>
@@ -58,6 +62,7 @@
 #include <kj/map.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 namespace workerd::server {
@@ -238,7 +243,6 @@ Server::Server(kj::Filesystem& fs,
       reportConfigWarning(kj::mv(reportConfigWarning)),
       loggingOptions(loggingOptions),
       memoryCacheProvider(kj::heap<api::MemoryCacheProvider>(timer)),
-      channelTokenHandler(*this),
       tasks(*this) {}
 
 struct Server::GlobalContext {
@@ -340,6 +344,14 @@ Server::~Server() noexcept {
   abortAllActors(KJ_EXCEPTION(DISCONNECTED, "Server shutting down."));
   tasks.clear();
 
+  // Tear down the cluster RPC system now that nothing can issue requests through it. This must
+  // happen after `tasks.clear()` (the accept loop task references the RpcSystem) and before the
+  // services are unlinked: open cluster connections export capabilities that hold references into
+  // services, and dropping those connections is what lets the unlink below eliminate all
+  // references. The ClusterLockManagers that reference `clusterRpc` live in ActorNamespaces, which
+  // are destroyed by WorkerService::unlink().
+  clusterRpc = kj::none;
+
   // Unlink all the services, which should remove all refcount cycles.
   unlinkWorkerLoaders();
   for (auto& service: services) {
@@ -366,6 +378,7 @@ class Server::ActorNamespace final {
       const kj::Clock& clock,
       kj::Timer& timer,
       capnp::ByteStreamFactory& byteStreamFactory,
+      capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
       ChannelTokenHandler& channelTokenHandler,
       kj::Network& dockerNetwork,
       kj::Maybe<kj::StringPtr> dockerPath,
@@ -377,6 +390,7 @@ class Server::ActorNamespace final {
         clock(clock),
         timer(timer),
         byteStreamFactory(byteStreamFactory),
+        httpOverCapnpFactory(httpOverCapnpFactory),
         channelTokenHandler(channelTokenHandler),
         dockerNetwork(dockerNetwork),
         dockerPath(dockerPath),
@@ -384,15 +398,48 @@ class Server::ActorNamespace final {
         waitUntilTasks(waitUntilTasks),
         selfTokensArePersistent(selfTokensArePersistent) {}
 
-  void link(kj::Maybe<const kj::Directory&> serviceActorStorage) {
+  void link(kj::Maybe<const kj::Directory&> serviceActorStorage,
+      kj::Maybe<ClusterRegistry&> clusterRegistry,
+      kj::Maybe<capnp::RpcSystem<cluster::VatId>&> clusterRpc) {
     KJ_IF_SOME(dir, serviceActorStorage) {
       KJ_IF_SOME(d, config.tryGet<Durable>()) {
         this->actorStorage.emplace(
-            dir.openSubdir(kj::Path({d.uniqueKey}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY));
+            dir.openSubdir(kj::Path({d.uniqueKey}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY),
+            *this);
+        KJ_IF_SOME(registry, clusterRegistry) {
+          auto& rpc = KJ_ASSERT_NONNULL(clusterRpc);
+          this->clusterRegistry = registry;
+          auto lockDirectory = KJ_ASSERT_NONNULL(this->actorStorage)
+                                   .directory->openSubdir(kj::Path({"locks"}),
+                                       kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+          this->lockManager.emplace(kj::mv(lockDirectory), registry, rpc, timer);
+        }
       }
     }
 
     KJ_IF_SOME(d, config.tryGet<Durable>()) {
+      if (lockManager != kj::none) {
+        if (KJ_ASSERT_NONNULL(clusterRegistry).nfsMode()) {
+          // Across machines (NFS) a shared SQLite file in WAL mode isn't safe: no alarms there.
+          // ClusterActorSqliteHooks refuses them, as before.
+          return;
+        }
+        // Cluster mode on one machine: every instance writes alarm times into the shared
+        // metadata.sqlite (the native VFS takes real file locks, so several processes can share it
+        // on a local disk); exactly one instance, the alarm leader, runs the AlarmScheduler.
+        // Leadership is an OFD lock on `alarm-leader`, so it moves to another instance when the
+        // leader goes away.
+        auto& as = KJ_ASSERT_NONNULL(this->actorStorage);
+        clusterAlarmStore = kj::heap<ClusterAlarmStore>(as.vfs);
+        alarmLeaderFile = as.directory->openFile(
+            kj::Path({"alarm-leader"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        alarmLeaderTask =
+            alarmLeaderLoop(kj::str(d.uniqueKey)).eagerlyEvaluate([](kj::Exception&& e) {
+          KJ_LOG(ERROR, "cluster alarm leader loop failed; alarms stop on this instance", e);
+        });
+        return;
+      }
+
       auto idFactory = kj::heap<ActorIdFactoryImpl>(d.uniqueKey);
       AlarmScheduler::GetActorFn getActor =
           [this, idFactory = kj::mv(idFactory)](
@@ -439,6 +486,8 @@ class Server::ActorNamespace final {
     return result;
   }
 
+  // Get the ActorChannel for the given actor ID, routing to the appropriate workerd instance
+  // if needed.
   kj::Own<IoChannelFactory::ActorChannel> getActorChannel(
       Worker::Actor::Id id, Persistent persistent = Persistent::NO) {
     KJ_IF_SOME(doId, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
@@ -452,7 +501,13 @@ class Server::ActorNamespace final {
       }
     }
 
-    return kj::refcounted<ActorChannelImpl>(getActorContainer(kj::mv(id)), persistent);
+    if (lockManager != kj::none) {
+      // Cluster mode: resolution of the owning node is deferred until the channel is first used,
+      // so that merely obtaining a stub never takes cluster locks or wakes actors.
+      return kj::refcounted<ClusterActorChannel>(*this, kj::mv(id), persistent);
+    } else {
+      return kj::refcounted<ActorChannelImpl>(getActorContainer(kj::mv(id)), persistent);
+    }
   }
 
   class ActorContainer;
@@ -485,8 +540,10 @@ class Server::ActorNamespace final {
         ActorNamespace& ns,
         kj::Maybe<ActorContainer&> parent,
         kj::OneOf<ClassAndId, kj::Promise<ClassAndId>> classAndIdParam,
-        kj::Timer& timer)
-        : key(kj::mv(key)),
+        kj::Timer& timer,
+        kj::Maybe<ClusterLockManager::OwnedLock> ownershipLock = kj::none)
+        : ownershipLock(kj::mv(ownershipLock)),
+          key(kj::mv(key)),
           tracker(kj::refcounted<RequestTracker>(*this)),
           ns(ns),
           root(parent.map([](ActorContainer& p) -> ActorContainer& { return p.root; })
@@ -532,6 +589,7 @@ class Server::ActorNamespace final {
         auto reason = 0;
         a->shutdown(reason);
       }
+      closeStorage();
 
       // Drop the container client reference
       // If setInactivityTimeout() was called, there's still a timer holding a reference
@@ -671,7 +729,9 @@ class Server::ActorNamespace final {
     // removed from any maps that would cause it to receive further traffic, since any further
     // requests will be expected to fail. abort() does NOT attempt to remove the ActorContainer
     // from the parent facet map since at most call sites it makes more sense to handle this
-    // directly.
+    // directly. Callers that remove the container from `ns.actors` must do so in the same
+    // synchronous continuation as this call: abort() releases the ownership lock (see
+    // `ownershipLock`).
     void abort(kj::Maybe<const kj::Exception&> reason) {
       if (brokenReason != kj::none) return;
 
@@ -692,8 +752,15 @@ class Server::ActorNamespace final {
       shutdownTask = kj::none;
       manager = kj::none;
       tracker->shutdown();
+      closeStorage();
       actor = kj::none;
       containerClient = kj::none;
+
+      // The actor (and every facet) shut down above and closeStorage() closed the database, so
+      // nothing on this node holds a handle into the actor's storage anymore. Drop ours and let
+      // another node (or a fresh container on this one) claim the actor.
+      facetTreeIndex = kj::none;
+      ownershipLock = kj::none;
 
       KJ_IF_SOME(r, reason) {
         brokenReason = r.clone();
@@ -703,15 +770,29 @@ class Server::ActorNamespace final {
     }
 
     // Resets the actor's SQLite database while the connection is still open,
-    // avoiding file-locking issues on Windows.
+    // avoiding file-locking issues on Windows. Storage that is already closed is skipped
+    // (reset() refuses to reopen a closed database).
     void resetStorage() {
       KJ_IF_SOME(a, actor) {
         KJ_IF_SOME(cache, a->getPersistent()) {
-          KJ_IF_SOME(db, cache.getSqliteDatabase()) {
-            kj::runCatchingExceptions([&]() { db.reset(); });
-          }
+          kj::runCatchingExceptions([&]() {
+            KJ_IF_SOME(db, cache.getSqliteDatabase()) {
+              db.reset();
+            }
+          });
         }
       }
+    }
+
+    // Closes the actor's SQLite connection so the database file is fully and synchronously
+    // released (WAL checkpointed and removed; in NFS mode the EXCLUSIVE lock dropped). Must run
+    // after the actor has been shut down (so ActorSqlite is `broken` and will not touch the
+    // connection again) and before `actor` is dropped (see `sqliteDb`). Idempotent.
+    void closeStorage() {
+      KJ_IF_SOME(db, sqliteDb) {
+        db.close();
+      }
+      sqliteDb = kj::none;
     }
 
     kj::Own<ActorContainer> getFacetContainer(
@@ -825,8 +906,37 @@ class Server::ActorNamespace final {
     }
 
    private:
+    // In cluster mode, the root container's claim on the actor. Declared first so that on plain
+    // destruction it is released only after everything below it -- the Worker::Actor, facets,
+    // hibernation manager, and facet tree index -- has been torn down.
+    //
+    // Invariant: an OwnedLock for the actor is alive on this node if and only if its container is
+    // in `ns.actors`. ClusterLockManager::acquireOrRoute() routes to this node whenever the lock
+    // file names it and the OFD lock is held, so an OwnedLock with no map entry would make every
+    // request for the actor loop through self-bootstrap (see ActorNamespace::resolveNode()). The
+    // lock is therefore released at the moment the container leaves the map (abort(),
+    // monitorOnBroken()), not when the last reference to the container is dropped. Releasing it
+    // there is only safe because closeStorage() runs first: by the time either path hollows the
+    // container, every SQLite handle under the actor and its facets is already closed, so no handle
+    // into the actor's storage outlives the claim even if an in-flight request still holds the
+    // Worker::Actor.
+    //
+    // The lock file's contents alone carry no such guarantee: a failed claim or release can leave
+    // this node's key behind with no OwnedLock held. acquireOrRoute() detects that (the OFD lock
+    // is free) and reclaims, so it needs no handling here.
+    kj::Maybe<ClusterLockManager::OwnedLock> ownershipLock;
+
     // The actor is constructed after the ActorContainer so it starts off empty.
     kj::Maybe<kj::Own<Worker::Actor>> actor;
+
+    // The actor's SQLite connection, owned by the ActorSqlite inside `actor`. Set by start() (the
+    // actor constructs its cache synchronously) and cleared by closeStorage(), which every path
+    // that drops `actor` calls first, so this never outlives the connection it refers to.
+    //
+    // The connection is closed here rather than in ActorSqlite::shutdown() because shutdown() can
+    // run synchronously inside a SQLite callback (e.g. a VFS write that hits a storage limit),
+    // where closing the handle is unsafe. The container only drops the actor from the event loop.
+    kj::Maybe<SqliteDatabase&> sqliteDb;
 
     kj::String key;
     kj::Own<RequestTracker> tracker;
@@ -883,6 +993,7 @@ class Server::ActorNamespace final {
             ns.actorStorage, "can't call getFacetId() when there's no backing storage");
         auto indexFile = as.directory->openFile(
             kj::Path({kj::str(key, ".facets")}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        ns.verifyRegistration();
         return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
       }
     }
@@ -900,6 +1011,7 @@ class Server::ActorNamespace final {
         auto indexFile = KJ_UNWRAP_OR(
             as.directory->tryOpenFile(kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
             return kj::none);
+        ns.verifyRegistration();
         return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
       }
     }
@@ -1021,6 +1133,15 @@ class Server::ActorNamespace final {
       tracker->shutdown();
       auto managerToDrop = kj::mv(manager);
 
+      // onBroken fired only after IoContext::abort() shut down the actor cache, and the facets
+      // were aborted above, so closing the database now is safe and leaves every database under
+      // this actor closed. Release the claim in the same synchronous continuation as the erase()
+      // below (see `ownershipLock`). Any stub still pinning this container after the erase keeps
+      // only a hollow shell.
+      closeStorage();
+      facetTreeIndex = kj::none;
+      ownershipLock = kj::none;
+
       // Note that we remove the entire ActorContainer from the map -- this drops the
       // HibernationManager so any connected hibernatable websockets will be disconnected.
       KJ_IF_SOME(p, parent) {
@@ -1072,6 +1193,7 @@ class Server::ActorNamespace final {
         a->shutdown(0, KJ_EXCEPTION(DISCONNECTED, "broken.dropped; Actor freed due to inactivity"));
       }
       // Destroy the last strong Worker::Actor reference.
+      closeStorage();
       actor = kj::none;
 
       // Drop our reference to the ContainerClient
@@ -1140,6 +1262,7 @@ class Server::ActorNamespace final {
       onBrokenTask = kj::none;
 
       // Destroy the last strong Worker::Actor reference.
+      closeStorage();
       actor = kj::none;
 
       if (webSocketMode == IoChannelFactory::EvictWebSocketMode::CLOSE) {
@@ -1245,7 +1368,15 @@ class Server::ActorNamespace final {
           KJ_IF_SOME(as, ns.actorStorage) {
             kj::Own<ActorSqlite::Hooks> sqliteHooks;
             if (parent == kj::none) {
-              KJ_IF_SOME(a, ns.alarmScheduler) {
+              if (ns.lockManager != kj::none) {
+                auto actorKey = ActorKey{.actorId = key, .name = actorName.map([](kj::String& n) {
+                  return n.asPtr();
+                })}.clone();
+                sqliteHooks = kj::heap<ClusterActorSqliteHooks>(
+                    ns.clusterAlarmStore.map(
+                        [](kj::Own<ClusterAlarmStore>& s) -> ClusterAlarmStore& { return *s; }),
+                    kj::mv(actorKey));
+              } else KJ_IF_SOME(a, ns.alarmScheduler) {
                 // clone() copies the id and name into storage owned by the returned ActorKey, so
                 // the temporary StringPtrs below only need to outlive this call.
                 auto actorKey = ActorKey{.actorId = key, .name = actorName.map([](kj::String& n) {
@@ -1268,9 +1399,15 @@ class Server::ActorNamespace final {
 
             // Before we do anything, make sure the database is in WAL mode. We also need to
             // do this after reset() is used, so register a callback for that.
+            if (ns.nfsMode()) {
+              db->run("PRAGMA locking_mode=EXCLUSIVE;");
+            }
             db->run("PRAGMA journal_mode=WAL;");
 
             db->afterReset([this, &dir = *as.directory, selfId](SqliteDatabase& db) {
+              if (ns.nfsMode()) {
+                db.run("PRAGMA locking_mode=EXCLUSIVE;");
+              }
               db.run("PRAGMA journal_mode=WAL;");
 
               // reset() is used when the app called deleteAll(), in which case we also want to
@@ -1284,6 +1421,8 @@ class Server::ActorNamespace final {
               deleteDescendantStorage(dir, selfId);
             });
 
+            KJ_ASSERT(sqliteDb == kj::none);
+            sqliteDb = *db;
             return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
                 [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
                 .attach(kj::mv(sqliteHooks));
@@ -1371,6 +1510,9 @@ class Server::ActorNamespace final {
             kj::mv(privileges));
       }
 
+      // If actor construction throws after makeActorCache ran, the database it recorded is
+      // destroyed along with the half-built actor; don't leave `sqliteDb` pointing at it.
+      KJ_ON_SCOPE_FAILURE(sqliteDb = kj::none);
       auto actor = actorClass->newActor(getTracker(), Worker::Actor::cloneId(id),
           kj::mv(makeActorCache), kj::mv(makeStorage), kj::mv(loopback), tryGetManagerRef(),
           kj::mv(container), kj::mv(containerImages), *this);
@@ -1390,28 +1532,29 @@ class Server::ActorNamespace final {
     kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
-      kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;
-      auto& abstractId = *KJ_ASSERT_NONNULL(id.tryGet<kj::Own<ActorIdFactory::ActorId>>());
-      auto& idImpl =
-          KJ_ASSERT_NONNULL(kj::tryDowncast<const ActorIdFactoryImpl::ActorIdImpl>(abstractId));
-      return ns.channelTokenHandler.encodeActorChannelToken(
-          usage, uniqueKey, idImpl.getRaw(), idImpl.getName(), persistent);
+      return ns.encodeActorChannelToken(usage, id, persistent);
     }
   };
 
-  kj::Own<ActorContainer> getActorContainer(Worker::Actor::Id id) {
-    kj::String key;
-
+  kj::String actorKey(const Worker::Actor::Id& id) {
     KJ_SWITCH_ONEOF(id) {
       KJ_CASE_ONEOF(obj, kj::Own<ActorIdFactory::ActorId>) {
         KJ_REQUIRE(config.is<Durable>());
-        key = obj->toString();
+        return obj->toString();
       }
       KJ_CASE_ONEOF(str, kj::String) {
         KJ_REQUIRE(config.is<Ephemeral>());
-        key = kj::str(str);
+        return kj::str(str);
       }
     }
+    KJ_UNREACHABLE;
+  }
+
+  // Get or create an ActorContainer. Use only when NOT in cluster mode.
+  kj::Own<ActorContainer> getActorContainer(Worker::Actor::Id id) {
+    KJ_REQUIRE(lockManager == kj::none);
+
+    kj::String key = actorKey(id);
 
     return actors
         .findOrCreate(key, [&]() mutable {
@@ -1421,6 +1564,65 @@ class Server::ActorNamespace final {
       return kj::HashMap<kj::StringPtr, kj::Own<ActorContainer>>::Entry{
         container->getKey(), kj::mv(container)};
     })->addRef();
+  }
+
+  // Create an ActorContainer in cluster mode. Must be called in the same synchronous continuation
+  // that received `ownership` from ClusterLockManager::acquireOrRoute(): an OwnedLock alive on
+  // this node while `actors` has no entry for the key would make requests for the actor loop
+  // through self-bootstrap until the entry appears (see resolveNode()).
+  kj::Own<ActorContainer> createActorContainer(
+      kj::String key, Worker::Actor::Id id, ClusterLockManager::OwnedLock ownership) {
+    // Invariant: an OwnedLock is alive on this node iff a container holding it is in `actors`. We
+    // hold the lock and are about to insert; nothing else may already be mapped. The other
+    // direction is upheld by ActorContainer::abort() and monitorOnBroken(), which release the
+    // lock as the container leaves the map.
+    KJ_ASSERT(actors.find(key) == kj::none);
+
+    auto container = kj::refcounted<ActorContainer>(kj::str(key), *this, kj::none,
+        ActorContainer::ClassAndId(kj::addRef(*actorClass), kj::mv(id)), timer, kj::mv(ownership));
+    actors.insert(container->getKey(), container->addRef());
+    return container;
+  }
+
+  // Which node currently owns the actor with the given key: a container on this node (created
+  // here if we just claimed the lock), or the owning node's cluster port. Not cached; callers
+  // cache what they derive from it. Every cluster-routed channel type resolves through this method
+  // so that the lock protocol lives in exactly one place. `key` and `id` must remain valid until
+  // the returned promise settles. Cluster mode only.
+  using Node = kj::OneOf<kj::Own<ActorContainer>, rpc::WorkerdClusterPort::Client>;
+  kj::Promise<Node> resolveNode(kj::StringPtr key, const Worker::Actor::Id& id) {
+    // Local-first. This lookup is what terminates the routing loop: when an OwnedLock on this
+    // node holds the actor, acquireOrRoute() returns our own cluster port with no backoff, and the
+    // resulting getChannelFromToken() decodes the token into a channel that lands right back here.
+    // That is only correct because "OwnedLock alive on this node" implies "container is in
+    // `actors`" -- see ActorContainer::ownershipLock.
+    KJ_IF_SOME(container, actors.find(key)) {
+      co_return container->addRef();
+    }
+
+    auto lockOrClient = co_await KJ_ASSERT_NONNULL(lockManager).acquireOrRoute(key);
+    KJ_SWITCH_ONEOF(lockOrClient) {
+      KJ_CASE_ONEOF(ownership, ClusterLockManager::OwnedLock) {
+        co_return createActorContainer(kj::str(key), Worker::Actor::cloneId(id), kj::mv(ownership));
+      }
+      KJ_CASE_ONEOF(clusterPort, rpc::WorkerdClusterPort::Client) {
+        co_return kj::mv(clusterPort);
+      }
+    }
+    KJ_UNREACHABLE;
+  }
+
+  // Encode a channel token pointing at the given actor in this namespace. The caller is
+  // responsible for having checked transferrability.
+  kj::Array<byte> encodeActorChannelToken(IoChannelFactory::ChannelTokenUsage usage,
+      const Worker::Actor::Id& id,
+      Persistent persistent) {
+    kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(config.tryGet<Durable>()).uniqueKey;
+    auto& abstractId = *KJ_ASSERT_NONNULL(id.tryGet<kj::Own<ActorIdFactory::ActorId>>());
+    auto& idImpl =
+        KJ_ASSERT_NONNULL(kj::tryDowncast<const ActorIdFactoryImpl::ActorIdImpl>(abstractId));
+    return channelTokenHandler.encodeActorChannelToken(
+        usage, uniqueKey, idImpl.getRaw(), idImpl.getName(), persistent);
   }
 
   kj::Own<ContainerClient> getContainerClient(
@@ -1528,8 +1730,12 @@ class Server::ActorNamespace final {
 
     abortAll(reason);
 
-    KJ_IF_SOME(scheduler, ownAlarmScheduler) {
-      scheduler->deleteAll();
+    // In cluster mode the alarm table is shared by every instance, and this only resets this
+    // instance's actors: leave it (each reset actor cancels its stale alarm when it is delivered).
+    if (lockManager == kj::none) {
+      KJ_IF_SOME(scheduler, ownAlarmScheduler) {
+        scheduler->deleteAll();
+      }
     }
   }
 
@@ -1542,15 +1748,27 @@ class Server::ActorNamespace final {
     kj::Own<const kj::Directory> directory;
     SqliteDatabase::Vfs vfs;
 
-    ActorStorage(kj::Own<const kj::Directory> directoryParam)
+    ActorStorage(kj::Own<const kj::Directory> directoryParam, ActorNamespace& ns)
         : directory(kj::mv(directoryParam)),
-          vfs(*directory) {}
+          vfs(*directory,
+              SqliteDatabase::VfsOptions{
+                .afterOpen = kj::Function<void()>(KJ_BIND_METHOD(ns, verifyRegistration)),
+              }) {}
   };
 
   // Note: The Vfs, actorStorage, and ownAlarmScheduler must not be torn down until all actors
   // have been torn down, so we declare them before `actors`.
   kj::Maybe<ActorStorage> actorStorage;
   kj::Maybe<kj::Own<AlarmScheduler>> ownAlarmScheduler;
+
+  kj::Maybe<ClusterRegistry&> clusterRegistry;
+  kj::Maybe<ClusterLockManager> lockManager;
+
+  // Cluster mode alarms (see alarmLeaderLoop()).
+  class ClusterAlarmStore;
+  kj::Maybe<kj::Own<ClusterAlarmStore>> clusterAlarmStore;
+  kj::Maybe<kj::Own<const kj::File>> alarmLeaderFile;
+  kj::Maybe<OfdLock> alarmLeaderLock;
 
   // Tracks the canceler and cleanup promise for a Docker container's lifecycle cleanup.
   // Useful to await on async calls of a ContainerClient destructor when the new
@@ -1585,8 +1803,11 @@ class Server::ActorNamespace final {
   ActorMap actors;
 
   kj::Maybe<kj::Promise<void>> cleanupTask;
+  // Declared after `actors` and the scheduler so it is torn down first.
+  kj::Maybe<kj::Promise<void>> alarmLeaderTask;
   kj::Timer& timer;
   capnp::ByteStreamFactory& byteStreamFactory;
+  capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
   ChannelTokenHandler& channelTokenHandler;
   kj::Network& dockerNetwork;
   kj::Maybe<kj::StringPtr> dockerPath;
@@ -1632,6 +1853,23 @@ class Server::ActorNamespace final {
       });
 
       co_await timer.atTime(now + EXPIRATION);
+    }
+  }
+
+  bool nfsMode() {
+    KJ_IF_SOME(r, clusterRegistry) {
+      return r.nfsMode();
+    } else {
+      return false;
+    }
+  }
+
+  // Callback called immediately after any actor storage file is opened to verify that the
+  // registry lock is still held, and therefore the new open must be on the same NFS lease as
+  // the registry lock.
+  void verifyRegistration() {
+    KJ_IF_SOME(r, clusterRegistry) {
+      r.verifyNfsLease();
     }
   }
 
@@ -1753,6 +1991,434 @@ class Server::ActorNamespace final {
       // Keep this message in sync with the equivalent error produced in actor-storage-factory.c++
       // in the internal codebase.
       JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
+    }
+  };
+
+  // Cluster mode: an actor's alarm time goes into the shared `_cf_ALARM` table, wherever the actor
+  // runs. The alarm leader's AlarmScheduler picks it up (AlarmScheduler::syncFromDb()).
+  class ClusterAlarmStore {
+   public:
+    explicit ClusterAlarmStore(const SqliteDatabase::Vfs& vfs)
+        : db([&] {
+            auto db = kj::heap<SqliteDatabase>(vfs, kj::Path({"metadata.sqlite"}),
+                kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+            // Other instances write the same file: wait for their (tiny) transactions.
+            db->run("PRAGMA busy_timeout = 2000;");
+            // Instances starting together race to create the table and switch it to WAL; SQLite
+            // answers SQLITE_BUSY at once in that case (busy_timeout does not cover it), so retry.
+            for (uint attempt = 0;; ++attempt) {
+              try {
+                AlarmScheduler::ensureInitialized(*db);
+                break;
+              } catch (...) {
+                auto e = kj::getCaughtExceptionAsKj();
+                if (attempt >= 100 || strstr(e.getDescription().cStr(), "SQLITE_BUSY") == nullptr) {
+                  kj::throwFatalException(kj::mv(e));
+                }
+                usleep(20 * 1000);
+              }
+            }
+            return kj::mv(db);
+          }()) {}
+
+    void set(const ActorKey& actor, kj::Date scheduledTime) {
+      int64_t scheduledTimeNs = (scheduledTime - kj::UNIX_EPOCH) / kj::NANOSECONDS;
+      SqliteDatabase::Query::ValuePtr nameParam = nullptr;
+      KJ_IF_SOME(n, actor.name) {
+        nameParam = n;
+      }
+      stmtSet.run(actor.actorId, scheduledTimeNs, nameParam);
+    }
+    void remove(const ActorKey& actor) {
+      stmtDelete.run(actor.actorId);
+    }
+
+   private:
+    kj::Own<SqliteDatabase> db;
+    SqliteDatabase::Statement stmtSet = db->prepare(R"(
+      INSERT INTO _cf_ALARM VALUES(?, ?, ?)
+        ON CONFLICT DO UPDATE SET scheduled_time = excluded.scheduled_time,
+          actor_name = COALESCE(excluded.actor_name, _cf_ALARM.actor_name);
+    )");
+    SqliteDatabase::Statement stmtDelete = db->prepare(R"(
+      DELETE FROM _cf_ALARM WHERE actor_id = ?
+    )");
+  };
+
+  class ClusterActorSqliteHooks final: public ActorSqlite::Hooks {
+   public:
+    // `store` is none across machines (NFS mode), where alarms are not supported.
+    ClusterActorSqliteHooks(kj::Maybe<ClusterAlarmStore&> store, kj::Own<ActorKey> actor)
+        : store(store),
+          actor(kj::mv(actor)) {}
+
+    kj::Promise<void> scheduleRun(
+        kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
+      auto& s = JSG_REQUIRE_NONNULL(store, Error,
+          "Durable Object alarms are not yet supported in cluster mode across machines (NFS); "
+          "they are supported when all instances share a local disk (network = \"unix\")");
+      KJ_IF_SOME(scheduledTime, newAlarmTime) {
+        s.set(*actor, scheduledTime);
+      } else {
+        s.remove(*actor);
+      }
+      return kj::READY_NOW;
+    }
+
+   private:
+    kj::Maybe<ClusterAlarmStore&> store;
+    kj::Own<ActorKey> actor;
+  };
+
+  // Cluster mode: try to become the alarm leader every second; once leader, run the
+  // AlarmScheduler and pick up alarm times the other instances wrote, every 250 ms. A due alarm is
+  // delivered like any request to the actor (ClusterActorChannel): to the instance that holds it, or
+  // claimed by this one when no instance does.
+  kj::Promise<void> alarmLeaderLoop(kj::String uniqueKey) {
+    auto& as = KJ_ASSERT_NONNULL(actorStorage);
+    for (;;) {
+      if (KJ_ASSERT_NONNULL(clusterRegistry).isDraining()) {
+        // A draining instance can't claim actors any more, so it can't deliver alarms either: hand
+        // leadership to another instance (dropping the scheduler cancels its pending deliveries; the
+        // next leader re-reads them from the table).
+        if (ownAlarmScheduler != kj::none) {
+          KJ_LOG(INFO, "draining: giving up alarm leadership", uniqueKey);
+        }
+        ownAlarmScheduler = kj::none;
+        alarmLeaderLock = kj::none;
+        co_return;
+      }
+      if (ownAlarmScheduler == kj::none) {
+        auto fd = KJ_ASSERT_NONNULL(KJ_ASSERT_NONNULL(alarmLeaderFile)->getFd());
+        KJ_IF_SOME(lock, OfdLock::tryLock(fd, OfdLock::EXCLUSIVE)) {
+          alarmLeaderLock = kj::mv(lock);
+          AlarmScheduler::GetActorFn getActor =
+              [this, idFactory = kj::heap<ActorIdFactoryImpl>(uniqueKey)](
+                  const ActorKey& actor) mutable -> kj::Own<WorkerInterface> {
+            Worker::Actor::Id id = idFactory->idFromStringNamed(
+                kj::str(actor.actorId), actor.name.map([](kj::StringPtr n) { return kj::str(n); }));
+            return getActorChannel(kj::mv(id))->startRequest({});
+          };
+          try {
+            auto scheduler = kj::heap<AlarmScheduler>(
+                clock, timer, as.vfs, kj::Path({"metadata.sqlite"}), kj::mv(getActor));
+            scheduler->enableClusterMode();
+            ownAlarmScheduler = kj::mv(scheduler);
+            KJ_LOG(INFO, "this instance is now the alarm leader", uniqueKey);
+          } catch (...) {
+            // e.g. SQLITE_BUSY while another instance initializes the table: give up the lock and
+            // try again next round.
+            KJ_LOG(WARNING, "could not start the alarm scheduler; retrying",
+                kj::getCaughtExceptionAsKj());
+            alarmLeaderLock = kj::none;
+          }
+        }
+      }
+      KJ_IF_SOME(scheduler, ownAlarmScheduler) {
+        try {
+          scheduler->syncFromDb();
+        } catch (...) {
+          KJ_LOG(WARNING, "cluster alarm sync failed; retrying", kj::getCaughtExceptionAsKj());
+        }
+        co_await timer.afterDelay(250 * kj::MILLISECONDS);
+      } else {
+        co_await timer.afterDelay(1 * kj::SECONDS);
+      }
+    }
+  }
+
+  // Base class for SubrequestChannels in cluster mode whose requests are routed to whichever node
+  // currently owns some root actor in this namespace: plain actor stubs (ClusterActorChannel) and
+  // restored stubs whose vendor chain bottoms out at such an actor
+  // (ClusterRestoredSubrequestChannel). Resolution of the owning node is deferred until first use,
+  // so that obtaining or deserializing a stub does not take cluster locks or wake remote actors.
+  //
+  // Server::wrapRestoredChannel() recognizes a cluster-routed vendor by this type and copies the
+  // root actor's identity out of it so that the wrapper can resolve that node for itself. No
+  // resolution state is shared between channels; each caches its own `target`.
+  class ClusterRoutedChannel: public IoChannelFactory::SubrequestChannel {
+   public:
+    ClusterRoutedChannel(ActorNamespace& ns, Worker::Actor::Id id)
+        : ns(ns),
+          id(kj::mv(id)),
+          key(ns.actorKey(this->id)) {}
+    ~ClusterRoutedChannel() noexcept(false) {
+      KJ_IF_SOME(t, target) {
+        KJ_IF_SOME(container, t.tryGet<kj::Own<ActorContainer>>()) {
+          container->updateAccessTime();
+        }
+      }
+    }
+
+    ActorNamespace& getRootNamespace() {
+      return ns;
+    }
+    const Worker::Actor::Id& getRootId() {
+      return id;
+    }
+
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+      return newPromisedWorkerInterface(startRequestImpl(kj::addRef(*this), kj::mv(metadata)));
+    }
+
+   protected:
+    ActorNamespace& ns;
+    Worker::Actor::Id id;
+    kj::String key;  // actorKey(id), computed once
+
+    // Where requests on this channel go, resolved on first startRequest() and retained for the
+    // life of the channel. Local: the container, pinned exactly as ActorChannelImpl pins it (and
+    // therefore the ownership lock). Remote: a WorkerdBootstrap for this channel's target on the
+    // owning node, obtained by sending the channel's own token to that node's
+    // WorkerdClusterPort.getChannelFromToken(). Retaining the target gives remote stubs the same
+    // failure semantics as local ones: a local channel keeps throwing `brokenReason` once its
+    // container breaks; a retained bootstrap likewise keeps failing once the far end breaks, rather
+    // than silently reaching a freshly re-instantiated actor on the next call.
+    using Target = kj::OneOf<kj::Own<ActorContainer>, rpc::WorkerdBootstrap::Client>;
+    kj::Maybe<Target> target;
+
+    // Resolves `target`, caching the result. Safe to call concurrently; all callers share one
+    // ns.resolveNode() attempt. A failed resolution is retained too, so every later request on the
+    // channel fails with the same exception.
+    kj::Promise<void> resolveTarget() {
+      if (target != kj::none) return kj::READY_NOW;
+      KJ_IF_SOME(r, resolving) return r.addBranch();
+      return resolving.emplace(resolveTargetImpl().fork()).addBranch();
+    }
+
+    // Start a request when `target` resolved to a container on this node.
+    virtual kj::Promise<kj::Own<WorkerInterface>> startLocalRequest(
+        ActorContainer& container, IoChannelFactory::SubrequestMetadata metadata) = 0;
+
+   private:
+    // Set once the first resolution starts. Its branches are only ever held by coroutines that
+    // also hold a reference to this channel, so the underlying resolution never outlives `this`.
+    kj::Maybe<kj::ForkedPromise<void>> resolving;
+
+    static rpc::WorkerdBootstrap::Client bootstrapFromToken(
+        rpc::WorkerdClusterPort::Client& clusterPort, kj::ArrayPtr<const byte> token) {
+      auto req = clusterPort.getChannelFromTokenRequest(
+          capnp::MessageSize{token.size() / sizeof(capnp::word) + 4, 0});
+      req.setToken(token);
+      return req.send().getBootstrap();
+    }
+
+    kj::Promise<void> resolveTargetImpl() {
+      auto node = co_await ns.resolveNode(key, id);
+      KJ_SWITCH_ONEOF(node) {
+        KJ_CASE_ONEOF(container, kj::Own<ActorContainer>) {
+          target = kj::mv(container);
+        }
+        KJ_CASE_ONEOF(clusterPort, rpc::WorkerdClusterPort::Client) {
+          // Convert the owner's cluster port into a bootstrap for this channel's target by sending
+          // it our own token. Nothing else on this channel needs the cluster port, so only the
+          // (pipelined) bootstrap is retained: if getChannelFromToken() fails, the bootstrap is
+          // broken and every later startEvent() fails with that exception. A restored token may
+          // be asynchronous (when its restoreArg holds channels with asynchronous tokens); a
+          // promise capability covers that case with the same semantics.
+          KJ_SWITCH_ONEOF(getTokenMaybeSync(IoChannelFactory::ChannelTokenUsage::RPC)) {
+            KJ_CASE_ONEOF(token, kj::Array<byte>) {
+              target = bootstrapFromToken(clusterPort, token);
+            }
+            KJ_CASE_ONEOF(promise, kj::Promise<kj::Array<byte>>) {
+              target = rpc::WorkerdBootstrap::Client(
+                  promise.then([clusterPort = kj::mv(clusterPort)](kj::Array<byte> token) mutable {
+                return bootstrapFromToken(clusterPort, token);
+              }));
+            }
+          }
+        }
+      }
+    }
+
+    static kj::Promise<kj::Own<WorkerInterface>> startRequestImpl(
+        kj::Own<ClusterRoutedChannel> self, IoChannelFactory::SubrequestMetadata metadata) {
+      co_await self->resolveTarget();
+
+      KJ_SWITCH_ONEOF(KJ_ASSERT_NONNULL(self->target)) {
+        KJ_CASE_ONEOF(container, kj::Own<ActorContainer>) {
+          co_return co_await self->startLocalRequest(*container, kj::mv(metadata));
+        }
+        KJ_CASE_ONEOF(bootstrap, rpc::WorkerdBootstrap::Client) {
+          capnp::MessageSize sizeHint{4, 0};
+          KJ_IF_SOME(cf, metadata.cfBlobJson) {
+            sizeHint.wordCount += cf.size() / sizeof(capnp::word) + 1;
+          }
+
+          // The remote instance reconstructs SubrequestMetadata from these params.
+          auto req = bootstrap.startEventRequest(sizeHint);
+          KJ_IF_SOME(cf, metadata.cfBlobJson) {
+            req.setCfBlobJson(cf);
+          }
+          req.setFromPersistentStub(metadata.fromPersistentStub.toBool());
+
+          auto dispatcher = req.sendForPipeline().getDispatcher();
+          // Restore events never cross the cluster -- restored stubs are forwarded as whole
+          // tokens instead (see ClusterRestoredSubrequestChannel) -- so no FrankenvalueHandler is
+          // needed to marshal restore params here.
+          co_return kj::heap<RpcWorkerInterface>(self->ns.httpOverCapnpFactory,
+              self->ns.byteStreamFactory, getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher));
+        }
+      }
+      KJ_UNREACHABLE;
+    }
+  };
+
+  // Channel to a root actor in this namespace in cluster mode.
+  class ClusterActorChannel final: public ClusterRoutedChannel {
+   public:
+    ClusterActorChannel(ActorNamespace& ns, Worker::Actor::Id id, Persistent persistent)
+        : ClusterRoutedChannel(ns, kj::mv(id)),
+          persistent(persistent) {}
+
+    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+      // If this channel was reconstructed from a persistent (stored) stub, signal the target so it
+      // can re-verify that it still allows persistent stubs.
+      metadata.fromPersistentStub = metadata.fromPersistentStub || persistent;
+      return ClusterRoutedChannel::startRequest(kj::mv(metadata));
+    }
+
+    kj::Promise<void> evictForTest(IoChannelFactory::EvictWebSocketMode webSocketMode) override {
+      KJ_IF_SOME(t, target) {
+        KJ_SWITCH_ONEOF(t) {
+          KJ_CASE_ONEOF(container, kj::Own<ActorContainer>) {
+            return container->evictForTest(webSocketMode).attach(kj::addRef(*this));
+          }
+          KJ_CASE_ONEOF(_, rpc::WorkerdBootstrap::Client) {
+            JSG_FAIL_REQUIRE(Error,
+                "Cannot evict Durable Object: it is owned by another workerd instance in the "
+                "cluster.");
+          }
+        }
+      }
+
+      // Not resolved yet. If the actor is running on this node, evict it without pinning it to
+      // this channel.
+      KJ_IF_SOME(container, ns.actors.find(key)) {
+        return container->evictForTest(webSocketMode).attach(container->addRef());
+      }
+      JSG_FAIL_REQUIRE(Error, "Cannot evict Durable Object: it is not currently running.");
+    }
+
+    void requireAllowsTransfer() override {
+      // Cluster mode only routes root actors of durable namespaces, which are always
+      // transferrable via channel tokens.
+    }
+
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+        IoChannelFactory::ChannelTokenUsage usage) override {
+      return ns.encodeActorChannelToken(usage, id, persistent);
+    }
+
+   private:
+    Persistent persistent;
+
+    kj::Promise<kj::Own<WorkerInterface>> startLocalRequest(
+        ActorContainer& container, IoChannelFactory::SubrequestMetadata metadata) override {
+      return container.startRequest(kj::mv(metadata)).attach(container.addRef());
+    }
+  };
+
+  // Wrapper around a decoded `restored` SubrequestChannel whose vendor chain bottoms out at a
+  // cluster-routed actor. Rather than replaying `[restore]()` hop-by-hop across the network (which
+  // could not carry `restoredSelfTokenFactory`, so a remotely-restored facet could not itself call
+  // `ctx.restore()`), the whole token is either run locally (this node owns the root actor) or
+  // shipped to the owning node, which decodes it and runs the entire restore chain in-process.
+  //
+  // The wrapped `local` tree already knows how to re-encode itself for the wire, including
+  // converting STORAGE-usage tokens to RPC-usage at every nesting level. For a multiply-nested
+  // token each level is wrapped; only the outermost wrapper is ever exercised on the remote path,
+  // and on the local path each level's resolution finds the container the outer one created or
+  // found (see ActorNamespace::resolveNode()).
+  class ClusterRestoredSubrequestChannel final: public ClusterRoutedChannel {
+   public:
+    ClusterRestoredSubrequestChannel(
+        ClusterRoutedChannel& vendor, kj::Own<IoChannelFactory::SubrequestChannel> local)
+        : ClusterRoutedChannel(
+              vendor.getRootNamespace(), Worker::Actor::cloneId(vendor.getRootId())),
+          local(kj::mv(local)) {}
+
+    kj::Promise<void> evictForTest(IoChannelFactory::EvictWebSocketMode webSocketMode) override {
+      return local->evictForTest(webSocketMode);
+    }
+
+    void requireAllowsTransfer() override {
+      local->requireAllowsTransfer();
+    }
+
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+        IoChannelFactory::ChannelTokenUsage usage) override {
+      return local->getTokenMaybeSync(usage);
+    }
+
+   private:
+    kj::Own<IoChannelFactory::SubrequestChannel> local;
+
+    kj::Promise<kj::Own<WorkerInterface>> startLocalRequest(
+        ActorContainer& container, IoChannelFactory::SubrequestMetadata metadata) override {
+      // `local` caches its restored channel across requests, as it does outside cluster mode. The
+      // root ClusterActorChannel inside it resolves to the container we just found or created.
+      return local->startRequest(kj::mv(metadata));
+    }
+  };
+
+  // RpcChannel counterpart of ClusterRestoredSubrequestChannel. `restore()` is a fresh-session
+  // operation by contract, so nothing is retained across calls here: each call resolves the owning
+  // node anew and either restores locally or opens a session on the owner via
+  // WorkerdClusterPort.getRpcTargetFromToken().
+  class ClusterRestoredRpcChannel final: public IoChannelFactory::RpcChannel {
+   public:
+    ClusterRestoredRpcChannel(
+        ClusterRoutedChannel& vendor, kj::Own<IoChannelFactory::RpcChannel> local)
+        : ns(vendor.getRootNamespace()),
+          id(Worker::Actor::cloneId(vendor.getRootId())),
+          key(ns.actorKey(id)),
+          local(kj::mv(local)) {}
+
+    Session restore() override {
+      auto split = restoreImpl(kj::addRef(*this)).split();
+      return {
+        .cap = kj::mv(kj::get<0>(split)),
+        .task = kj::mv(kj::get<1>(split)),
+      };
+    }
+
+    void requireAllowsTransfer() override {
+      local->requireAllowsTransfer();
+    }
+
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+        IoChannelFactory::ChannelTokenUsage usage) override {
+      return local->getTokenMaybeSync(usage);
+    }
+
+   private:
+    ActorNamespace& ns;
+    Worker::Actor::Id id;
+    kj::String key;
+    kj::Own<IoChannelFactory::RpcChannel> local;
+
+    static kj::Promise<kj::Tuple<rpc::JsRpcTarget::Client, kj::Promise<void>>> restoreImpl(
+        kj::Own<ClusterRestoredRpcChannel> self) {
+      auto node = co_await self->ns.resolveNode(self->key, self->id);
+      KJ_SWITCH_ONEOF(node) {
+        KJ_CASE_ONEOF(container, kj::Own<ActorContainer>) {
+          // The root ClusterActorChannel inside `local` resolves to the container we just found or
+          // created and pins it for the session.
+          auto session = self->local->restore();
+          co_return kj::tuple(kj::mv(session.cap), session.task.attach(kj::mv(self)));
+        }
+        KJ_CASE_ONEOF(clusterPort, rpc::WorkerdClusterPort::Client) {
+          auto token = co_await self->local->getToken(IoChannelFactory::ChannelTokenUsage::RPC);
+          auto req = clusterPort.getRpcTargetFromTokenRequest(
+              capnp::MessageSize{token.size() / sizeof(capnp::word) + 4, 0});
+          req.setToken(token);
+          auto sent = req.send();
+          auto session = api::wrapRemoteRpcSession(sent.getTarget(), sent.getSession());
+          co_return kj::tuple(kj::mv(session.cap), session.task.attach(kj::mv(self)));
+        }
+      }
+      KJ_UNREACHABLE;
     }
   };
 };
@@ -3432,6 +4098,8 @@ class Server::WorkerService final: public Service,
     kj::Array<kj::Rc<WorkerLoaderNamespace>> workerLoaders;
     kj::Maybe<kj::Network&> workerdDebugPortNetwork;
     kj::Maybe<Server&> workerdDebugPortServer;
+    kj::Maybe<ClusterRegistry&> clusterRegistry;
+    kj::Maybe<capnp::RpcSystem<cluster::VatId>&> clusterRpc;
   };
   using LinkCallback =
       kj::Function<LinkedIoChannels(WorkerService&, Worker::ValidationErrorReporter&)>;
@@ -3493,8 +4161,9 @@ class Server::WorkerService final: public Service,
       auto actorClass = kj::refcounted<ActorClassImpl>(*this, entry.key, Frankenvalue());
       auto ns = kj::heap<ActorNamespace>(kj::mv(actorClass), entry.value,
           kj::systemPreciseCalendarClock(), threadContext.getUnsafeTimer(),
-          threadContext.getByteStreamFactory(), channelTokenHandler, network, dockerPath,
-          containerEgressInterceptorImage, waitUntilTasks, selfTokensArePersistent());
+          threadContext.getByteStreamFactory(), threadContext.getHttpOverCapnpFactory(),
+          channelTokenHandler, network, dockerPath, containerEgressInterceptorImage, waitUntilTasks,
+          selfTokensArePersistent());
       KJ_IF_SOME(d, entry.value.tryGet<Durable>()) {
         actorNamespacesByUniqueKey.insert(d.uniqueKey, ns.get());
       }
@@ -3627,7 +4296,7 @@ class Server::WorkerService final: public Service,
     auto linked = callback(*this, errorReporter);
 
     for (auto& ns: actorNamespaces) {
-      ns.value->link(linked.actorStorage);
+      ns.value->link(linked.actorStorage, linked.clusterRegistry, linked.clusterRpc);
     }
 
     ioChannels = kj::mv(linked);
@@ -5920,6 +6589,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
     WorkerService::LinkedIoChannels result;
+    KJ_IF_SOME(registry, this->clusterRegistry) {
+      result.clusterRegistry = *registry;
+      result.clusterRpc = KJ_ASSERT_NONNULL(this->clusterRpc);
+    }
 
     auto entrypointNames = workerService.getEntrypointNames();
     auto actorClassNames = workerService.getActorClassNames();
@@ -6097,7 +6770,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   kj::Maybe<kj::StringPtr> serviceName;
   if (!def.isDynamic) serviceName = name;
 
-  auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
+  auto result = kj::refcounted<WorkerService>(KJ_ASSERT_NONNULL(channelTokenHandler), serviceName,
       globalContext->threadContext, monotonicClock, kj::mv(worker),
       kj::mv(errorReporter.defaultEntrypoint), kj::mv(errorReporter.namedEntrypoints),
       kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
@@ -6302,6 +6975,28 @@ kj::Own<IoChannelFactory::ActorChannel> Server::resolveActor(kj::StringPtr names
   return ns.getActorChannel(kj::mv(idObj), persistent);
 }
 
+kj::Own<IoChannelFactory::TokenizableChannel> Server::wrapRestoredChannel(ChannelToken::Type type,
+    IoChannelFactory::SubrequestChannel& vendor,
+    kj::Own<IoChannelFactory::TokenizableChannel> local) {
+  KJ_IF_SOME(routed, kj::tryDowncast<ActorNamespace::ClusterRoutedChannel>(vendor)) {
+    switch (type) {
+      case ChannelToken::Type::SUBREQUEST:
+        return kj::refcounted<ActorNamespace::ClusterRestoredSubrequestChannel>(
+            routed, kj::mv(local).downcast<IoChannelFactory::SubrequestChannel>());
+      case ChannelToken::Type::RPC:
+        return kj::refcounted<ActorNamespace::ClusterRestoredRpcChannel>(
+            routed, kj::mv(local).downcast<IoChannelFactory::RpcChannel>());
+      case ChannelToken::Type::ACTOR_CLASS:
+        KJ_UNREACHABLE;  // decodeChannelTokenImpl() already rejected this
+    }
+    KJ_UNREACHABLE;
+  }
+
+  // The vendor is a static service, or we are not in cluster mode (resolveActor() then returns a
+  // plain ActorChannelImpl). Nothing to route.
+  return kj::mv(local);
+}
+
 // =======================================================================================
 
 class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
@@ -6372,8 +7067,30 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
       throwUnsupported();
     }
 
+    // Cluster mode: the alarm leader delivers a due alarm to the instance that holds the actor
+    // (AlarmScheduler -> ClusterActorChannel -> here).
     kj::Promise<void> runAlarm(RunAlarmContext context) override {
-      throwUnsupported();
+      auto params = context.getParams();
+      auto scheduledTime = kj::UNIX_EPOCH + params.getScheduledTime() * kj::MILLISECONDS;
+      auto worker = getWorker();
+      auto result = co_await worker->runAlarm(scheduledTime, params.getRetryCount());
+      auto resp = context.getResults().initResult();
+      resp.setOutcome(result.outcome);
+      resp.setRetry(result.retry);
+      resp.setRetryCountsAgainstLimit(result.retryCountsAgainstLimit);
+      KJ_IF_SOME(d, result.errorDescription) {
+        resp.setErrorDescription(d);
+      }
+    }
+
+    kj::Promise<void> abandonAlarm(AbandonAlarmContext context) override {
+      auto scheduledTime =
+          kj::UNIX_EPOCH + context.getParams().getScheduledTimeMs() * kj::MILLISECONDS;
+      auto worker = getWorker();
+      auto stored = co_await worker->abandonAlarm(scheduledTime);
+      KJ_IF_SOME(t, stored) {
+        context.getResults().setStoredAlarmTimeMs((t - kj::UNIX_EPOCH) / kj::MILLISECONDS);
+      }
     }
 
     kj::Promise<void> queue(QueueContext context) override {
@@ -6412,9 +7129,12 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
     }
 
     kj::Own<WorkerInterface> getWorker() {
-      // For non-HTTP events (RPC, traces, etc.), create WorkerInterface with
-      // empty metadata since there's no HTTP request to extract cf from.
-      return getService()->startRequest({});
+      // For non-HTTP events (RPC, traces, etc.), there's no HTTP request to extract cf from, so
+      // cfBlobJson is left unset. fromPersistentStub must still be propagated so that the target
+      // re-verifies allow_irrevocable_stub_storage.
+      IoChannelFactory::SubrequestMetadata metadata;
+      metadata.fromPersistentStub = fromPersistentStub;
+      return getService()->startRequest(kj::mv(metadata));
     }
 
     [[noreturn]] void throwUnsupported() {
@@ -6791,8 +7511,12 @@ class Server::WorkerdDebugPortImpl final: public rpc::WorkerdDebugPort::Server {
         auto decoded = kj::decodeHex(actorIdStr);
         KJ_REQUIRE(decoded.size() == SHA256_DIGEST_LENGTH,
             "Invalid Durable Object ID: expected 64 hex characters (32 bytes)", decoded.size());
+        kj::Maybe<kj::String> name;
+        if (params.hasActorName()) {
+          name = params.getActorName().clone();
+        }
         kj::Own<ActorIdFactory::ActorId> id =
-            kj::heap<ActorIdFactoryImpl::ActorIdImpl>(decoded.begin(), kj::none);
+            kj::heap<ActorIdFactoryImpl::ActorIdImpl>(decoded.begin(), kj::mv(name));
         actorId = kj::mv(id);
       }
       KJ_CASE_ONEOF(c, Ephemeral) {
@@ -6805,6 +7529,48 @@ class Server::WorkerdDebugPortImpl final: public rpc::WorkerdDebugPort::Server {
     context.initResults(capnp::MessageSize{4, 1})
         .setActor(kj::heap<WorkerdBootstrapImpl>(
             actorNamespace.getActorChannel(kj::mv(actorId)), httpOverCapnpFactory));
+    return kj::READY_NOW;
+  }
+
+ private:
+  workerd::server::Server& srv;
+  capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
+};
+
+// Bootstrap served to cluster peers. Every method takes a channel token, so this grants nothing
+// beyond what the caller's tokens already do; see WorkerdClusterPort in worker-interface.capnp.
+class Server::WorkerdClusterPortImpl final: public rpc::WorkerdClusterPort::Server {
+ public:
+  WorkerdClusterPortImpl(
+      workerd::server::Server& srv, capnp::HttpOverCapnpFactory& httpOverCapnpFactory)
+      : srv(srv),
+        httpOverCapnpFactory(httpOverCapnpFactory) {}
+
+  kj::Promise<void> getChannelFromToken(GetChannelFromTokenContext context) override {
+    // Decoding on this node yields the same lazy channel tree the sender has. If we own the root
+    // actor, its ClusterActorChannel resolves locally and any restore chain runs in-process with
+    // correct self-tokens; if we have just lost ownership, it re-claims or forwards to the new
+    // owner. Either way this is bounded by the invariant described at ActorContainer::ownershipLock.
+    auto channel = KJ_ASSERT_NONNULL(srv.channelTokenHandler)
+                       .decodeSubrequestChannelToken(IoChannelFactory::ChannelTokenUsage::RPC,
+                           context.getParams().getToken());
+    context.initResults(capnp::MessageSize{4, 1})
+        .setBootstrap(kj::heap<WorkerdBootstrapImpl>(kj::mv(channel), httpOverCapnpFactory));
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> getRpcTargetFromToken(GetRpcTargetFromTokenContext context) override {
+    auto channel = KJ_ASSERT_NONNULL(srv.channelTokenHandler)
+                       .decodeRpcChannelToken(IoChannelFactory::ChannelTokenUsage::RPC,
+                           context.getParams().getToken());
+    auto session = channel->restore();
+
+    auto results = context.getResults(capnp::MessageSize{4, 2});
+    results.setTarget(kj::mv(session.cap));
+    // The returned session capability keeps the session alive; dropping it cancels the task. Same
+    // shape as RestoreRpcStubCustomEvent::receiveRpc().
+    results.setSession(session.task.then(
+        [channel = kj::mv(channel)]() { return rpc::JsRpcSession::Client(nullptr); }));
     return kj::READY_NOW;
   }
 
@@ -6857,6 +7623,29 @@ kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
     // doc comment, we instead add the promise to `tasks` to be safe.
     tasks.add(httpServer.httpServer.drain());
   }
+
+  KJ_IF_SOME(registry, clusterRegistry) {
+    // When draining begins, we stop accepting cluster RPC connections (`clusterRpc`'s accept
+    // loop is joined with `forkedDrainWhen` -- see `startServices()`). As such, as soon as we
+    // start draining, all actors hosted here become unreachable from the rest of the cluster. We
+    // MUST, therefore, abort them, and refuse to claim any more: an in-flight local request that
+    // reaches an unowned actor during the drain would otherwise make this node its owner (see
+    // ClusterLockManager::acquireOrRoute()).
+    //
+    // TODO(clustering): This is a harsh ending for actors on this machine. We should really evict
+    //   each one at a time that is convenient, and wait some time for RPC requests to drain.
+    //   As of this writing, though, we don't really have any machinery for determining what time
+    //   is "convenient" nor for doing any sort of clean hand-off between instances of an actor.
+    //   The Cloudflare production behavior is widely considered not great: draining instances lose
+    //   access to storage but are allowed to finish in-flight requests. The DO team has plans to
+    //   replace this behavior with something better in the not-so-distant future (maybe), so for
+    //   now we don't try to recreate it here -- we just hard-abort actors when drain starts. Note
+    //   that it is important that we abort at drain start rather than continue accepting cluster
+    //   connections until fully drained since we want actor locks to be released cleanly; a stale
+    //   lock takes more effort to clean up.
+    registry->startDraining();
+    abortAllActors(kj::none);
+  }
 }
 
 kj::Promise<void> Server::run(
@@ -6876,6 +7665,8 @@ kj::Promise<void> Server::run(
   } else {
     loggingOptions.structuredLogging = StructuredLogging(config.getStructuredLogging());
   }
+
+  setupChannelTokenHandler(config);
 
   kj::HttpHeaderTable::Builder headerTableBuilder;
   globalContext = kj::heap<GlobalContext>(*this, v8System, headerTableBuilder);
@@ -6897,6 +7688,15 @@ kj::Promise<void> Server::run(
   auto ownHeaderTable = headerTableBuilder.build();
 
   co_return co_await listenPromise.exclusiveJoin(kj::mv(fatalPromise));
+}
+
+void Server::setupChannelTokenHandler(config::Config::Reader config) {
+  ChannelTokenHandler::Resolver& tokenResolver = *this;
+  kj::Maybe<kj::StringPtr> channelTokenKey;
+  if (config.hasCluster()) {
+    channelTokenKey = config.getCluster().getKey();
+  }
+  channelTokenHandler.emplace(tokenResolver, channelTokenKey);
 }
 
 // Configure and start the inspector socket, returning the port the socket started on.
@@ -7024,7 +7824,22 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
           }
           goto validDurableObjectStorage;
         case config::Worker::DurableObjectStorage::IN_MEMORY:
+          if (config.hasCluster() && hadDurable) {
+            reportConfigError(kj::str("Worker service \"", name,
+                "\" uses in-memory Durable Object storage, which is not supported in cluster "
+                "mode."));
+          }
+          goto validDurableObjectStorage;
         case config::Worker::DurableObjectStorage::LOCAL_DISK:
+          if (config.hasCluster() && hadDurable &&
+              workerConf.getDurableObjectStorage().getLocalDisk() !=
+                  config.getCluster().getSharedDirectory()) {
+            reportConfigError(
+                kj::str("Worker service \"", name, "\" uses Durable Object storage disk service \"",
+                    workerConf.getDurableObjectStorage().getLocalDisk(),
+                    "\", but cluster.sharedDirectory is \"",
+                    config.getCluster().getSharedDirectory(), "\"."));
+          }
           goto validDurableObjectStorage;
       }
       reportConfigError(kj::str("Encountered unknown durableObjectStorage type in service \"", name,
@@ -7086,6 +7901,49 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
 
     return decltype(services)::Entry{kj::str("internet"_kj), kj::mv(service)};
   });
+
+  if (config.hasCluster()) {
+    if (!experimental) {
+      reportConfigError(
+          "Cluster mode is experimental and subject to change. You must run workerd with "
+          "`--experimental` to use it."_kj.clone());
+    }
+#ifndef __linux__
+    reportConfigError("Cluster mode is currently implemented only on Linux."_kj.clone());
+#endif
+
+    auto cluster = config.getCluster();
+    KJ_IF_SOME(sharedDirService, services.find(cluster.getSharedDirectory())) {
+      auto diskSvc = dynamic_cast<DiskDirectoryService*>(sharedDirService.get());
+      if (diskSvc == nullptr) {
+        reportConfigError(kj::str("cluster.sharedDirectory refers to service \"",
+            cluster.getSharedDirectory(), "\", but that service is not a disk directory."));
+      } else KJ_IF_SOME(dir, diskSvc->getWritable()) {
+        auto registryDir = dir.openSubdir(
+            kj::Path({cluster.getRegistrySubdir()}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        auto registry =
+            kj::heap<ClusterRegistry>(kj::mv(registryDir), cluster.getNetwork(), network, timer);
+        tasks.add(registry->runMaintenance().exclusiveJoin(forkedDrainWhen.addBranch()));
+        auto& reg = *clusterRegistry.emplace(kj::mv(registry));
+        clusterRpc.emplace(capnp::makeRpcServer(reg,
+            rpc::WorkerdClusterPort::Client(
+                kj::heap<WorkerdClusterPortImpl>(*this, globalContext->httpOverCapnpFactory))));
+
+        // TODO(clustering): We really shouldn't start accepting connections until the server
+        //   is totally up, but the RPC system actually starts accepting immediately on
+        //   construction, even if you don't call run().
+        KJ_IF_SOME(rpc, clusterRpc) {
+          tasks.add(rpc.run().exclusiveJoin(forkedDrainWhen.addBranch()));
+        }
+      } else {
+        reportConfigError(kj::str("cluster.sharedDirectory refers to disk service \"",
+            cluster.getSharedDirectory(), "\", but that service is defined read-only."));
+      }
+    } else {
+      reportConfigError(kj::str("cluster.sharedDirectory refers to service \"",
+          cluster.getSharedDirectory(), "\", but no such service is defined."));
+    }
+  }
 
   // Third pass: Cross-link services.
   for (auto& service: services) {
@@ -7303,6 +8161,8 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
   } else {
     loggingOptions.structuredLogging = StructuredLogging(config.getStructuredLogging());
   }
+
+  setupChannelTokenHandler(config);
 
   kj::HttpHeaderTable::Builder headerTableBuilder;
   globalContext = kj::heap<GlobalContext>(*this, v8System, headerTableBuilder);

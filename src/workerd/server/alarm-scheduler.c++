@@ -291,7 +291,7 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
         entry.value.task = abandonAlarm(actorRef.clone(), scheduledTime);
         co_return;
       }
-      deleteAlarm(actorRef);
+      finishAlarm(actorRef, scheduledTime);
     }
   } catch (...) {
     auto exception = kj::getCaughtExceptionAsKj();
@@ -300,11 +300,28 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
 }
 
 kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date scheduledTime) {
+  bool notified = false;
   try {
     co_await getActor(*actor)->abandonAlarm(scheduledTime);
+    notified = true;
   } catch (...) {
     auto exception = kj::getCaughtExceptionAsKj();
     KJ_LOG(WARNING, "abandonAlarm notification failed, keeping alarm in scheduler", exception);
+  }
+  if (!notified) {
+    if (clusterMode) {
+      // Don't move this task out of its own entry from inside the same turn it was resumed in.
+      co_await kj::yield();
+      // The row is still in the shared table: forget the entry (a FINISHED entry with no task
+      // would otherwise swallow later times for this actor) and let syncFromDb() deliver it again.
+      KJ_IF_SOME(entry, alarms.findEntry(*actor)) {
+        if (entry.value.status == AlarmStatus::FINISHED &&
+            entry.value.scheduledTime == scheduledTime) {
+          tasks.add(kj::mv(entry.value.task));
+          alarms.erase(entry);
+        }
+      }
+    }
     co_return;
   }
 
@@ -319,9 +336,95 @@ kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date
     KJ_IF_SOME(replacement, entry.value.queuedAlarm) {
       entry.value = scheduleAlarm(clock.now(), kj::mv(entry.value.actor), replacement);
     } else {
-      deleteAlarm(*actor);
+      finishAlarm(*actor, scheduledTime);
     }
   }
+}
+
+void AlarmScheduler::enableClusterMode() {
+  clusterMode = true;
+  // Other instances write the same table (server.c++ ClusterAlarmStore).
+  db->run("PRAGMA busy_timeout = 2000;");
+}
+
+void AlarmScheduler::finishAlarm(const ActorKey& actor, kj::Date scheduledTime) {
+  if (!clusterMode) {
+    deleteAlarm(actor);
+    return;
+  }
+  // Cluster mode: the scheduler never writes the shared table. The actor owns its row: after a
+  // successful run ActorSqlite clears its alarm, which reaches ClusterActorSqliteHooks on whichever
+  // instance holds it, and an alarm set by the handler is written there the same way. Deleting the
+  // row here could drop that newer alarm if the holder's write failed. A row that is still there is
+  // delivered again by syncFromDb(), and ActorSqlite::armAlarmHandler() cancels a delivery that no
+  // longer matches its own alarm state (re-requesting the time it does hold).
+  recentlyFinished.upsert(kj::str(actor.actorId),
+      RecentlyFinished{scheduledTime, clock.now() + RECENTLY_FINISHED_GRACE},
+      [](RecentlyFinished& existing, RecentlyFinished&& replacement) { existing = replacement; });
+  KJ_IF_SOME(entry, alarms.findEntry(actor)) {
+    KJ_IF_SOME(queued, entry.value.queuedAlarm) {
+      entry.value = scheduleAlarm(clock.now(), kj::mv(entry.value.actor), queued);
+    } else if (entry.value.status != AlarmStatus::STARTED) {
+      alarms.erase(entry);
+    }
+  }
+}
+
+void AlarmScheduler::syncFromDb() {
+  KJ_REQUIRE(clusterMode);
+  auto now = clock.now();
+  kj::HashSet<kj::String> present;
+
+  auto query = db->run(R"(
+    SELECT actor_id, scheduled_time, actor_name FROM _cf_ALARM;
+  )");
+  while (!query.isDone()) {
+    auto date = kj::UNIX_EPOCH + (kj::NANOSECONDS * query.getInt64(1));
+    ActorKey probe{.actorId = query.getText(0), .name = query.getMaybeText(2)};
+    present.insert(kj::str(probe.actorId));
+
+    KJ_IF_SOME(entry, alarms.findEntry(probe)) {
+      auto& alarm = entry.value;
+      if (alarm.status == AlarmStatus::WAITING) {
+        // Moved earlier or later by the actor: only the latest time counts.
+        if (alarm.scheduledTime != date) {
+          alarm = scheduleAlarm(now, kj::mv(alarm.actor), date);
+        }
+      } else if (alarm.scheduledTime != date) {
+        // Running, or waiting to retry: a different time is an alarm set meanwhile, which runs
+        // after this one (as setAlarm() does in single-process mode).
+        alarm.queuedAlarm = date;
+      }
+    } else {
+      // The actor deletes the row of an alarm that ran, a little after the run returns: don't
+      // deliver that same time again while its deletion may still be on its way.
+      KJ_IF_SOME(f, recentlyFinished.find(probe.actorId)) {
+        if (f.scheduledTime == date && now < f.until) {
+          query.nextRow();
+          continue;
+        }
+      }
+      // New, or one this process has never seen (another leader before it, or an actor that set
+      // its alarm on another process): schedule it. It wakes the actor wherever it lives, or
+      // claims it here if no process holds it.
+      auto actor = probe.clone();
+      auto& actorRef = *actor;
+      alarms.insert(actorRef, scheduleAlarm(now, kj::mv(actor), date));
+    }
+    query.nextRow();
+  }
+
+  // Rows the actors deleted: cancel those still waiting (running ones finish by themselves).
+  kj::Vector<kj::Own<ActorKey>> gone;
+  for (auto& entry: alarms) {
+    if (entry.value.status == AlarmStatus::WAITING && !present.contains(entry.key.actorId)) {
+      gone.add(entry.value.actor->clone());
+    }
+  }
+  for (auto& actor: gone) {
+    alarms.erase(*actor);
+  }
+  recentlyFinished.eraseAll([&](auto& key, RecentlyFinished& f) { return f.until <= now; });
 }
 
 void AlarmScheduler::taskFailed(kj::Exception&& e) {

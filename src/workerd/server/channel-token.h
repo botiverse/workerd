@@ -45,6 +45,20 @@ class ChannelTokenHandler {
         kj::ArrayPtr<const byte> id,
         kj::Maybe<kj::StringPtr> name,
         Persistent persistent) = 0;
+
+    // Called after decoding a `restored` token (a token that encodes calling [restore]() on the
+    // result of some other token). This gives the resolver an opportunity to replace the channel
+    // with something else. Simply returning `local` is valid when running in single-instance mode.
+    // When running in clustered mode (Durable Objects distributed over a cluster), the restorer
+    // checks whether `vendor` refers to a remote actor and, if so, returns a channel that makes
+    // an RPC to the remote actor's machine, sending the full original token, to be parsed there
+    // instead.
+    virtual kj::Own<IoChannelFactory::TokenizableChannel> wrapRestoredChannel(
+        ChannelToken::Type type,
+        IoChannelFactory::SubrequestChannel& vendor,
+        kj::Own<IoChannelFactory::TokenizableChannel> local) {
+      return kj::mv(local);
+    }
   };
 
   // workerd's implementation of `IoChannelFactory::SelfTokenFactory`. Produces the encoded
@@ -58,7 +72,7 @@ class ChannelTokenHandler {
         IoChannelFactory::ChannelTokenUsage usage) = 0;
   };
 
-  explicit ChannelTokenHandler(Resolver& resolver);
+  explicit ChannelTokenHandler(Resolver& resolver, kj::Maybe<kj::StringPtr> clusterKey = kj::none);
 
   // Helpers to implement `IoChannelFactory::{SubrequestChannel,ActorClassChannel}::getToken()`.
   //

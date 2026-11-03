@@ -1,0 +1,56 @@
+# Botiverse fork only: build the Linux x64 workerd binary for the cluster-alarms branch on a standard
+# GitHub runner. Upstream's builds use Cloudflare's 16-core runners and remote cache, which this fork
+# has neither of, so this is a plain from-scratch build (a few hours; Bazel's disk cache is kept
+# between runs to make later builds faster).
+name: Botiverse build
+
+on:
+  push:
+    branches:
+      - botiverse/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: botiverse-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    # GitHub-hosted jobs stop at 6 hours.
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Install the toolchain (clang, libc++ and lld 19+, tcl; see README.md)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-19 libc++-19-dev libc++abi-19-dev lld-19 tcl8.6
+          # Bazel's sandbox only sees /bin, /usr/bin and /usr/local/bin.
+          sudo ln -sf /usr/bin/clang-19 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-19 /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/tclsh8.6 /usr/local/bin/tclsh
+      - uses: actions/cache@v5
+        with:
+          path: ~/bazel-disk-cache
+          key: botiverse-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel') }}-${{ github.sha }}
+          restore-keys: |
+            botiverse-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel') }}-
+      - name: Build
+        # The Android SDK was removed above (disk space); without these the Android rules find it empty and fail.
+        run: env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_NDK_LATEST_HOME bazel build //src/workerd/server:workerd --config=release --disk_cache=~/bazel-disk-cache --jobs=4
+      - name: Check the binary runs
+        run: bazel-bin/src/workerd/server/workerd --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workerd-linux-x64-${{ github.sha }}
+          path: bazel-bin/src/workerd/server/workerd
+          retention-days: 30
