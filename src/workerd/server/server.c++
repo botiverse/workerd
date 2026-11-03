@@ -420,10 +420,16 @@ class Server::ActorNamespace final {
 
     KJ_IF_SOME(d, config.tryGet<Durable>()) {
       if (lockManager != kj::none) {
-        // Cluster mode: every instance writes alarm times into the shared metadata.sqlite (the
-        // native VFS takes real file locks, so several processes can share it on a local disk);
-        // exactly one instance, the alarm leader, runs the AlarmScheduler. Leadership is an OFD lock
-        // on `alarm-leader`, so it moves to another instance when the leader goes away.
+        if (KJ_ASSERT_NONNULL(clusterRegistry).nfsMode()) {
+          // Across machines (NFS) a shared SQLite file in WAL mode isn't safe: no alarms there.
+          // ClusterActorSqliteHooks refuses them, as before.
+          return;
+        }
+        // Cluster mode on one machine: every instance writes alarm times into the shared
+        // metadata.sqlite (the native VFS takes real file locks, so several processes can share it
+        // on a local disk); exactly one instance, the alarm leader, runs the AlarmScheduler.
+        // Leadership is an OFD lock on `alarm-leader`, so it moves to another instance when the
+        // leader goes away.
         auto& as = KJ_ASSERT_NONNULL(this->actorStorage);
         clusterAlarmStore = kj::heap<ClusterAlarmStore>(as.vfs);
         alarmLeaderFile = as.directory->openFile(
@@ -1368,7 +1374,10 @@ class Server::ActorNamespace final {
                   return n.asPtr();
                 })}.clone();
                 sqliteHooks = kj::heap<ClusterActorSqliteHooks>(
-                    *KJ_ASSERT_NONNULL(ns.clusterAlarmStore), kj::mv(actorKey));
+                    ns.clusterAlarmStore.map([](kj::Own<ClusterAlarmStore>& s) -> ClusterAlarmStore& {
+                  return *s;
+                }),
+                    kj::mv(actorKey));
               } else KJ_IF_SOME(a, ns.alarmScheduler) {
                 // clone() copies the id and name into storage owned by the returned ActorKey, so
                 // the temporary StringPtrs below only need to outlive this call.
@@ -1723,8 +1732,12 @@ class Server::ActorNamespace final {
 
     abortAll(reason);
 
-    KJ_IF_SOME(scheduler, ownAlarmScheduler) {
-      scheduler->deleteAll();
+    // In cluster mode the alarm table is shared by every instance, and this only resets this
+    // instance's actors: leave it (each reset actor cancels its stale alarm when it is delivered).
+    if (lockManager == kj::none) {
+      KJ_IF_SOME(scheduler, ownAlarmScheduler) {
+        scheduler->deleteAll();
+      }
     }
   }
 
@@ -2036,22 +2049,26 @@ class Server::ActorNamespace final {
 
   class ClusterActorSqliteHooks final: public ActorSqlite::Hooks {
    public:
-    ClusterActorSqliteHooks(ClusterAlarmStore& store, kj::Own<ActorKey> actor)
+    // `store` is none across machines (NFS mode), where alarms are not supported.
+    ClusterActorSqliteHooks(kj::Maybe<ClusterAlarmStore&> store, kj::Own<ActorKey> actor)
         : store(store),
           actor(kj::mv(actor)) {}
 
     kj::Promise<void> scheduleRun(
         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
+      auto& s = JSG_REQUIRE_NONNULL(store, Error,
+          "Durable Object alarms are not yet supported in cluster mode across machines (NFS); "
+          "they are supported when all instances share a local disk (network = \"unix\")");
       KJ_IF_SOME(scheduledTime, newAlarmTime) {
-        store.set(*actor, scheduledTime);
+        s.set(*actor, scheduledTime);
       } else {
-        store.remove(*actor);
+        s.remove(*actor);
       }
       return kj::READY_NOW;
     }
 
    private:
-    ClusterAlarmStore& store;
+    kj::Maybe<ClusterAlarmStore&> store;
     kj::Own<ActorKey> actor;
   };
 
@@ -2062,6 +2079,17 @@ class Server::ActorNamespace final {
   kj::Promise<void> alarmLeaderLoop(kj::String uniqueKey) {
     auto& as = KJ_ASSERT_NONNULL(actorStorage);
     for (;;) {
+      if (KJ_ASSERT_NONNULL(clusterRegistry).isDraining()) {
+        // A draining instance can't claim actors any more, so it can't deliver alarms either: hand
+        // leadership to another instance (dropping the scheduler cancels its pending deliveries; the
+        // next leader re-reads them from the table).
+        if (ownAlarmScheduler != kj::none) {
+          KJ_LOG(INFO, "draining: giving up alarm leadership", uniqueKey);
+        }
+        ownAlarmScheduler = kj::none;
+        alarmLeaderLock = kj::none;
+        co_return;
+      }
       if (ownAlarmScheduler == kj::none) {
         auto fd = KJ_ASSERT_NONNULL(KJ_ASSERT_NONNULL(alarmLeaderFile)->getFd());
         KJ_IF_SOME(lock, OfdLock::tryLock(fd, OfdLock::EXCLUSIVE)) {

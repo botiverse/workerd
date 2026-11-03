@@ -86,8 +86,7 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   // Cluster mode (several workerd processes sharing one storage directory). Only one process, the
   // alarm leader, runs a scheduler; every process writes alarm times straight into the shared
   // `_cf_ALARM` table (ClusterAlarmStore in server.c++). The leader calls syncFromDb() regularly to
-  // pick up those writes, and only deletes a row after an alarm ran if the row still holds the time
-  // that ran, so an alarm set by the handler while it was running (on another process) survives.
+  // pick up those writes, and never writes the table itself: each actor keeps its own row.
   void enableClusterMode();
   void syncFromDb();
 
@@ -143,13 +142,18 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   SqliteDatabase::Statement stmtDeleteAlarm = db->prepare(R"(
     DELETE FROM _cf_ALARM WHERE actor_id = ?
   )");
-  SqliteDatabase::Statement stmtDeleteAlarmIfTime = db->prepare(R"(
-    DELETE FROM _cf_ALARM WHERE actor_id = ? AND scheduled_time = ?
-  )");
   bool clusterMode = false;
-  // After an alarm at `scheduledTime` finished for good: forget it, and delete its row (in cluster
-  // mode only if the row still holds that time).
+  // After an alarm at `scheduledTime` finished for good: forget it, and delete its row (cluster
+  // mode: leave the row to the actor, see finishAlarm()).
   void finishAlarm(const ActorKey& actor, kj::Date scheduledTime);
+  // Cluster mode: alarms that just ran, so syncFromDb() doesn't deliver them again while the actor's
+  // deletion of the row is still on its way.
+  static constexpr auto RECENTLY_FINISHED_GRACE = 5 * kj::SECONDS;
+  struct RecentlyFinished {
+    kj::Date scheduledTime;
+    kj::Date until;
+  };
+  kj::HashMap<kj::String, RecentlyFinished> recentlyFinished;
 
   void taskFailed(kj::Exception&& exception) override;
 
