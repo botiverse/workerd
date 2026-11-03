@@ -9,8 +9,9 @@
 //   1. Consistent DO state across instances (single-writer correctness).
 //   2. Transparent forwarding when a request arrives at the "wrong" instance.
 //   3. Takeover after a node is killed.
-//   4. Alarms are rejected with a clear error in cluster mode.
-//   5. No `metadata.sqlite` is ever created (no AlarmScheduler in cluster mode).
+//   4. Unix variant: an alarm runs exactly once, wherever the object lives.
+//      CIDR (NFS) variant: alarms are rejected with a clear error, and
+//   5. no `metadata.sqlite` is ever created (no AlarmScheduler across machines).
 //   6. Storing/loading a DO stub without calling it takes no ownership lock.
 //   7. A broken DO releases its ownership lock even while stubs still pin it,
 //      so it can be re-instantiated (on any node) instead of hanging requests.
@@ -46,6 +47,9 @@ assert(
 );
 
 const CONTROL_FD = 3;
+
+// The CIDR variant stands in for a cluster across machines (NFS mode), where alarms stay unsupported.
+const NFS_VARIANT = env.WD_TEST_CONFIG.includes('cidr');
 
 // A minimal harness specialized for the cluster test. Unlike server-harness.mjs
 // it:
@@ -516,7 +520,7 @@ test('cluster: draining node refuses to claim an unowned DO', async () => {
   });
 });
 
-test('cluster: alarms are rejected with a clear error', async () => {
+test('cluster: alarms are rejected across machines (CIDR/NFS variant)', { skip: !NFS_VARIANT }, async () => {
   await withCluster(1, async ({ nodes, sharedPath }) => {
     // Fire the request. In cluster mode `setAlarm()` does not throw
     // synchronously to the JS code -- the rejection happens during output-gate
@@ -566,7 +570,7 @@ test('cluster: alarms are rejected with a clear error', async () => {
     );
 
     // No per-namespace metadata.sqlite should exist anywhere under the
-    // shared directory -- in cluster mode the AlarmScheduler is never
+    // shared directory -- across machines the AlarmScheduler is never
     // constructed.
     const nsDir = join(sharedPath, 'counter-test-namespace');
     let entries = [];
@@ -580,6 +584,45 @@ test('cluster: alarms are rejected with a clear error', async () => {
     assert(
       !entries.some((name) => name.startsWith('metadata.sqlite')),
       `cluster mode must not create metadata.sqlite; found: ${entries.join(', ')}`
+    );
+  });
+});
+
+test('cluster: an alarm runs once, delivered across instances (unix variant)', { skip: NFS_VARIANT }, async () => {
+  await withCluster(2, async ({ nodes, sharedPath }) => {
+    // Set the alarm through node 0 (which then holds the object), read it back
+    // through node 1 (forwarded to the holder) once it is due.
+    const set = await fetch(
+      `http://127.0.0.1:${nodes[0].httpPort}/set-alarm?name=alarm-test&ms=1000`
+    );
+    const setBody = await set.json();
+    assert.strictEqual(set.status, 200, JSON.stringify(setBody));
+
+    const deadline = Date.now() + 15000;
+    let state;
+    while (Date.now() < deadline) {
+      const r = await fetch(
+        `http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`
+      );
+      state = await r.json();
+      if (state.fired.length > 0) break;
+      await sleep(200);
+    }
+    assert.strictEqual(state.fired.length, 1, `alarm should run once: ${JSON.stringify(state)}`);
+    assert.strictEqual(state.alarm, null, `no alarm left after the run: ${JSON.stringify(state)}`);
+
+    // It must not run a second time (a stale table row is not re-run).
+    await sleep(3000);
+    const after = await (
+      await fetch(`http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`)
+    ).json();
+    assert.strictEqual(after.fired.length, 1, `alarm ran again: ${JSON.stringify(after)}`);
+
+    // The shared alarm table exists (one per namespace, shared by all instances).
+    const entries = await readdir(join(sharedPath, 'counter-test-namespace'));
+    assert(
+      entries.some((name) => name === 'metadata.sqlite'),
+      `expected metadata.sqlite; found: ${entries.join(', ')}`
     );
   });
 });

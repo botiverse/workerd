@@ -226,10 +226,11 @@ export class Counter extends DurableObject {
         id: idHex,
       });
     } else if (url.pathname === '/set-alarm') {
-      // Try to schedule an alarm 60s in the future. In cluster mode this should
-      // throw a clear error.
+      // Schedule an alarm `ms` milliseconds from now (default 60s). Across
+      // machines (the CIDR/NFS variant) this should throw a clear error.
       try {
-        await this.state.storage.setAlarm(Date.now() + 60_000);
+        const ms = Number(url.searchParams.get('ms') ?? 60_000);
+        await this.state.storage.setAlarm(Date.now() + ms);
         return Response.json({ ok: true, nodeId, id: idHex });
       } catch (err) {
         return Response.json(
@@ -237,6 +238,13 @@ export class Counter extends DurableObject {
           { status: 500 }
         );
       }
+    } else if (url.pathname === '/alarm-state') {
+      return Response.json({
+        nodeId,
+        id: idHex,
+        alarm: await this.state.storage.getAlarm(),
+        fired: (await this.state.storage.get('alarm-fired-on')) ?? [],
+      });
     } else if (url.pathname === '/identity') {
       return Response.json({ nodeId, id: idHex });
     } else if (url.pathname === '/store-stub') {
@@ -343,8 +351,10 @@ export class Counter extends DurableObject {
   }
 
   async alarm() {
-    // Should never be called in cluster mode; if it ever is, surface that via
-    // a stored marker so the test can observe the failure mode.
+    // Record which instance ran it (the unix variant checks it ran exactly once).
+    const fired = (await this.state.storage.get('alarm-fired-on')) ?? [];
+    fired.push(this.env.NODE_ID ?? null);
+    await this.state.storage.put('alarm-fired-on', fired);
     await this.state.storage.put('alarm-fired', true);
   }
 
