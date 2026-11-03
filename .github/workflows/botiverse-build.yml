@@ -45,7 +45,8 @@ jobs:
           restore-keys: |
             botiverse-bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel') }}-
       - name: Build
-        run: bazel build //src/workerd/server:workerd --config=release --disk_cache=~/bazel-disk-cache --jobs=4
+        # The Android SDK was removed above (disk space); without these the Android rules find it empty and fail.
+        run: env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_NDK_LATEST_HOME bazel build //src/workerd/server:workerd --config=release --disk_cache=~/bazel-disk-cache --jobs=4
       - name: Check the binary runs
         run: bazel-bin/src/workerd/server/workerd --version
       - uses: actions/upload-artifact@v7
