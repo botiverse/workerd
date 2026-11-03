@@ -83,6 +83,14 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   // Cancels all pending alarms and removes them from persistent storage.
   void deleteAll();
 
+  // Cluster mode (several workerd processes sharing one storage directory). Only one process, the
+  // alarm leader, runs a scheduler; every process writes alarm times straight into the shared
+  // `_cf_ALARM` table (ClusterAlarmStore in server.c++). The leader calls syncFromDb() regularly to
+  // pick up those writes, and only deletes a row after an alarm ran if the row still holds the time
+  // that ran, so an alarm set by the handler while it was running (on another process) survives.
+  void enableClusterMode();
+  void syncFromDb();
+
  private:
   enum class AlarmStatus { WAITING, STARTED, FINISHED };
   const kj::Clock& clock;
@@ -135,12 +143,23 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   SqliteDatabase::Statement stmtDeleteAlarm = db->prepare(R"(
     DELETE FROM _cf_ALARM WHERE actor_id = ?
   )");
+  SqliteDatabase::Statement stmtDeleteAlarmIfTime = db->prepare(R"(
+    DELETE FROM _cf_ALARM WHERE actor_id = ? AND scheduled_time = ?
+  )");
+  bool clusterMode = false;
+  // After an alarm at `scheduledTime` finished for good: forget it, and delete its row (in cluster
+  // mode only if the row still holds that time).
+  void finishAlarm(const ActorKey& actor, kj::Date scheduledTime);
 
   void taskFailed(kj::Exception&& exception) override;
 
   int maxJitterMsForDelay(kj::Duration delay);
 
+
+ public:
   static void ensureInitialized(SqliteDatabase& db);
+
+ private:
   void loadAlarmsFromDb();
 };
 

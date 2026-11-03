@@ -291,7 +291,7 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
         entry.value.task = abandonAlarm(actorRef.clone(), scheduledTime);
         co_return;
       }
-      deleteAlarm(actorRef);
+      finishAlarm(actorRef, scheduledTime);
     }
   } catch (...) {
     auto exception = kj::getCaughtExceptionAsKj();
@@ -319,8 +319,81 @@ kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date
     KJ_IF_SOME(replacement, entry.value.queuedAlarm) {
       entry.value = scheduleAlarm(clock.now(), kj::mv(entry.value.actor), replacement);
     } else {
-      deleteAlarm(*actor);
+      finishAlarm(*actor, scheduledTime);
     }
+  }
+}
+
+void AlarmScheduler::enableClusterMode() {
+  clusterMode = true;
+  // Other instances write the same table (server.c++ ClusterAlarmStore).
+  db->run("PRAGMA busy_timeout = 2000;");
+}
+
+void AlarmScheduler::finishAlarm(const ActorKey& actor, kj::Date scheduledTime) {
+  if (!clusterMode) {
+    deleteAlarm(actor);
+    return;
+  }
+  // Another process may have written a new time for this actor while the alarm ran (the handler
+  // calling setAlarm() on the process that owns the actor): only delete the row that ran.
+  int64_t scheduledTimeNs = (scheduledTime - kj::UNIX_EPOCH) / kj::NANOSECONDS;
+  stmtDeleteAlarmIfTime.run(actor.actorId, scheduledTimeNs);
+  KJ_IF_SOME(entry, alarms.findEntry(actor)) {
+    KJ_IF_SOME(queued, entry.value.queuedAlarm) {
+      entry.value = scheduleAlarm(clock.now(), kj::mv(entry.value.actor), queued);
+    } else if (entry.value.status != AlarmStatus::STARTED) {
+      alarms.erase(entry);
+    }
+  }
+  // A newer row, if any, is scheduled by the next syncFromDb().
+}
+
+void AlarmScheduler::syncFromDb() {
+  KJ_REQUIRE(clusterMode);
+  auto now = clock.now();
+  kj::HashSet<kj::String> present;
+
+  auto query = db->run(R"(
+    SELECT actor_id, scheduled_time, actor_name FROM _cf_ALARM;
+  )");
+  while (!query.isDone()) {
+    auto date = kj::UNIX_EPOCH + (kj::NANOSECONDS * query.getInt64(1));
+    ActorKey probe{.actorId = query.getText(0), .name = query.getMaybeText(2)};
+    present.insert(kj::str(probe.actorId));
+
+    KJ_IF_SOME(entry, alarms.findEntry(probe)) {
+      auto& alarm = entry.value;
+      if (alarm.status == AlarmStatus::WAITING) {
+        // Moved earlier or later by the actor: only the latest time counts.
+        if (alarm.scheduledTime != date) {
+          alarm = scheduleAlarm(now, kj::mv(alarm.actor), date);
+        }
+      } else if (alarm.scheduledTime != date) {
+        // Running, or waiting to retry: a different time is an alarm set meanwhile, which runs
+        // after this one (as setAlarm() does in single-process mode).
+        alarm.queuedAlarm = date;
+      }
+    } else {
+      // New, or one this process has never seen (another leader before it, or an actor that set
+      // its alarm on another process): schedule it. It wakes the actor wherever it lives, or
+      // claims it here if no process holds it.
+      auto actor = probe.clone();
+      auto& actorRef = *actor;
+      alarms.insert(actorRef, scheduleAlarm(now, kj::mv(actor), date));
+    }
+    query.nextRow();
+  }
+
+  // Rows the actors deleted: cancel those still waiting (running ones finish by themselves).
+  kj::Vector<kj::Own<ActorKey>> gone;
+  for (auto& entry: alarms) {
+    if (entry.value.status == AlarmStatus::WAITING && !present.contains(entry.key.actorId)) {
+      gone.add(entry.value.actor->clone());
+    }
+  }
+  for (auto& actor: gone) {
+    alarms.erase(*actor);
   }
 }
 

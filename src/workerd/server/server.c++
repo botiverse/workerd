@@ -60,7 +60,10 @@
 #include <kj/glob-filter.h>
 #include <kj/map.h>
 
+#include <unistd.h>
+
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 namespace workerd::server {
@@ -417,9 +420,18 @@ class Server::ActorNamespace final {
 
     KJ_IF_SOME(d, config.tryGet<Durable>()) {
       if (lockManager != kj::none) {
-        // TODO(clustering): Support alarms in cluster mode. Until then, we must skip creating
-        //   an AlarmScheduler altogether otherwise multiple instances will fight over the alarm
-        //   database.
+        // Cluster mode: every instance writes alarm times into the shared metadata.sqlite (the
+        // native VFS takes real file locks, so several processes can share it on a local disk);
+        // exactly one instance, the alarm leader, runs the AlarmScheduler. Leadership is an OFD lock
+        // on `alarm-leader`, so it moves to another instance when the leader goes away.
+        auto& as = KJ_ASSERT_NONNULL(this->actorStorage);
+        clusterAlarmStore = kj::heap<ClusterAlarmStore>(as.vfs);
+        alarmLeaderFile = as.directory->openFile(
+            kj::Path({"alarm-leader"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+        alarmLeaderTask = alarmLeaderLoop(kj::str(d.uniqueKey))
+                              .eagerlyEvaluate([](kj::Exception&& e) {
+          KJ_LOG(ERROR, "cluster alarm leader loop failed; alarms stop on this instance", e);
+        });
         return;
       }
 
@@ -1352,7 +1364,11 @@ class Server::ActorNamespace final {
             kj::Own<ActorSqlite::Hooks> sqliteHooks;
             if (parent == kj::none) {
               if (ns.lockManager != kj::none) {
-                sqliteHooks = kj::heap<ClusterActorSqliteHooks>();
+                auto actorKey = ActorKey{.actorId = key, .name = actorName.map([](kj::String& n) {
+                  return n.asPtr();
+                })}.clone();
+                sqliteHooks = kj::heap<ClusterActorSqliteHooks>(
+                    *KJ_ASSERT_NONNULL(ns.clusterAlarmStore), kj::mv(actorKey));
               } else KJ_IF_SOME(a, ns.alarmScheduler) {
                 // clone() copies the id and name into storage owned by the returned ActorKey, so
                 // the temporary StringPtrs below only need to outlive this call.
@@ -1737,6 +1753,12 @@ class Server::ActorNamespace final {
   kj::Maybe<ClusterRegistry&> clusterRegistry;
   kj::Maybe<ClusterLockManager> lockManager;
 
+  // Cluster mode alarms (see alarmLeaderLoop()).
+  class ClusterAlarmStore;
+  kj::Maybe<kj::Own<ClusterAlarmStore>> clusterAlarmStore;
+  kj::Maybe<kj::Own<const kj::File>> alarmLeaderFile;
+  kj::Maybe<OfdLock> alarmLeaderLock;
+
   // Tracks the canceler and cleanup promise for a Docker container's lifecycle cleanup.
   // Useful to await on async calls of a ContainerClient destructor when the new
   // one appears before they've been resolved.
@@ -1770,6 +1792,8 @@ class Server::ActorNamespace final {
   ActorMap actors;
 
   kj::Maybe<kj::Promise<void>> cleanupTask;
+  // Declared after `actors` and the scheduler so it is torn down first.
+  kj::Maybe<kj::Promise<void>> alarmLeaderTask;
   kj::Timer& timer;
   capnp::ByteStreamFactory& byteStreamFactory;
   capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
@@ -1959,14 +1983,123 @@ class Server::ActorNamespace final {
     }
   };
 
+  // Cluster mode: an actor's alarm time goes into the shared `_cf_ALARM` table, wherever the actor
+  // runs. The alarm leader's AlarmScheduler picks it up (AlarmScheduler::syncFromDb()).
+  class ClusterAlarmStore {
+   public:
+    explicit ClusterAlarmStore(const SqliteDatabase::Vfs& vfs)
+        : db([&] {
+            auto db = kj::heap<SqliteDatabase>(vfs, kj::Path({"metadata.sqlite"}),
+                kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+            // Other instances write the same file: wait for their (tiny) transactions.
+            db->run("PRAGMA busy_timeout = 2000;");
+            // Instances starting together race to create the table and switch it to WAL; SQLite
+            // answers SQLITE_BUSY at once in that case (busy_timeout does not cover it), so retry.
+            for (uint attempt = 0;; ++attempt) {
+              try {
+                AlarmScheduler::ensureInitialized(*db);
+                break;
+              } catch (...) {
+                auto e = kj::getCaughtExceptionAsKj();
+                if (attempt >= 100 || strstr(e.getDescription().cStr(), "SQLITE_BUSY") == nullptr) {
+                  kj::throwFatalException(kj::mv(e));
+                }
+                usleep(20 * 1000);
+              }
+            }
+            return kj::mv(db);
+          }()) {}
+
+    void set(const ActorKey& actor, kj::Date scheduledTime) {
+      int64_t scheduledTimeNs = (scheduledTime - kj::UNIX_EPOCH) / kj::NANOSECONDS;
+      SqliteDatabase::Query::ValuePtr nameParam = nullptr;
+      KJ_IF_SOME(n, actor.name) {
+        nameParam = n;
+      }
+      stmtSet.run(actor.actorId, scheduledTimeNs, nameParam);
+    }
+    void remove(const ActorKey& actor) {
+      stmtDelete.run(actor.actorId);
+    }
+
+   private:
+    kj::Own<SqliteDatabase> db;
+    SqliteDatabase::Statement stmtSet = db->prepare(R"(
+      INSERT INTO _cf_ALARM VALUES(?, ?, ?)
+        ON CONFLICT DO UPDATE SET scheduled_time = excluded.scheduled_time,
+          actor_name = COALESCE(excluded.actor_name, _cf_ALARM.actor_name);
+    )");
+    SqliteDatabase::Statement stmtDelete = db->prepare(R"(
+      DELETE FROM _cf_ALARM WHERE actor_id = ?
+    )");
+  };
+
   class ClusterActorSqliteHooks final: public ActorSqlite::Hooks {
    public:
+    ClusterActorSqliteHooks(ClusterAlarmStore& store, kj::Own<ActorKey> actor)
+        : store(store),
+          actor(kj::mv(actor)) {}
+
     kj::Promise<void> scheduleRun(
         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
-      // TODO(clustering): Support alarms.
-      JSG_FAIL_REQUIRE(Error, "Durable Object alarms are not yet supported in cluster mode");
+      KJ_IF_SOME(scheduledTime, newAlarmTime) {
+        store.set(*actor, scheduledTime);
+      } else {
+        store.remove(*actor);
+      }
+      return kj::READY_NOW;
     }
+
+   private:
+    ClusterAlarmStore& store;
+    kj::Own<ActorKey> actor;
   };
+
+  // Cluster mode: try to become the alarm leader every second; once leader, run the
+  // AlarmScheduler and pick up alarm times the other instances wrote, every 250 ms. A due alarm is
+  // delivered like any request to the actor (ClusterActorChannel): to the instance that holds it, or
+  // claimed by this one when no instance does.
+  kj::Promise<void> alarmLeaderLoop(kj::String uniqueKey) {
+    auto& as = KJ_ASSERT_NONNULL(actorStorage);
+    for (;;) {
+      if (ownAlarmScheduler == kj::none) {
+        auto fd = KJ_ASSERT_NONNULL(KJ_ASSERT_NONNULL(alarmLeaderFile)->getFd());
+        KJ_IF_SOME(lock, OfdLock::tryLock(fd, OfdLock::EXCLUSIVE)) {
+          alarmLeaderLock = kj::mv(lock);
+          AlarmScheduler::GetActorFn getActor =
+              [this, idFactory = kj::heap<ActorIdFactoryImpl>(uniqueKey)](
+                  const ActorKey& actor) mutable -> kj::Own<WorkerInterface> {
+            Worker::Actor::Id id = idFactory->idFromStringNamed(
+                kj::str(actor.actorId), actor.name.map([](kj::StringPtr n) { return kj::str(n); }));
+            return getActorChannel(kj::mv(id))->startRequest({});
+          };
+          try {
+            auto scheduler = kj::heap<AlarmScheduler>(
+                clock, timer, as.vfs, kj::Path({"metadata.sqlite"}), kj::mv(getActor));
+            scheduler->enableClusterMode();
+            ownAlarmScheduler = kj::mv(scheduler);
+            KJ_LOG(INFO, "this instance is now the alarm leader", uniqueKey);
+          } catch (...) {
+            // e.g. SQLITE_BUSY while another instance initializes the table: give up the lock and
+            // try again next round.
+            KJ_LOG(WARNING, "could not start the alarm scheduler; retrying",
+                kj::getCaughtExceptionAsKj());
+            alarmLeaderLock = kj::none;
+          }
+        }
+      }
+      KJ_IF_SOME(scheduler, ownAlarmScheduler) {
+        try {
+          scheduler->syncFromDb();
+        } catch (...) {
+          KJ_LOG(WARNING, "cluster alarm sync failed; retrying", kj::getCaughtExceptionAsKj());
+        }
+        co_await timer.afterDelay(250 * kj::MILLISECONDS);
+      } else {
+        co_await timer.afterDelay(1 * kj::SECONDS);
+      }
+    }
+  }
 
   // Base class for SubrequestChannels in cluster mode whose requests are routed to whichever node
   // currently owns some root actor in this namespace: plain actor stubs (ClusterActorChannel) and
@@ -6908,8 +7041,30 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
       throwUnsupported();
     }
 
+    // Cluster mode: the alarm leader delivers a due alarm to the instance that holds the actor
+    // (AlarmScheduler -> ClusterActorChannel -> here).
     kj::Promise<void> runAlarm(RunAlarmContext context) override {
-      throwUnsupported();
+      auto params = context.getParams();
+      auto scheduledTime = kj::UNIX_EPOCH + params.getScheduledTime() * kj::MILLISECONDS;
+      auto worker = getWorker();
+      auto result = co_await worker->runAlarm(scheduledTime, params.getRetryCount());
+      auto resp = context.getResults().initResult();
+      resp.setOutcome(result.outcome);
+      resp.setRetry(result.retry);
+      resp.setRetryCountsAgainstLimit(result.retryCountsAgainstLimit);
+      KJ_IF_SOME(d, result.errorDescription) {
+        resp.setErrorDescription(d);
+      }
+    }
+
+    kj::Promise<void> abandonAlarm(AbandonAlarmContext context) override {
+      auto scheduledTime =
+          kj::UNIX_EPOCH + context.getParams().getScheduledTimeMs() * kj::MILLISECONDS;
+      auto worker = getWorker();
+      auto stored = co_await worker->abandonAlarm(scheduledTime);
+      KJ_IF_SOME(t, stored) {
+        context.getResults().setStoredAlarmTimeMs((t - kj::UNIX_EPOCH) / kj::MILLISECONDS);
+      }
     }
 
     kj::Promise<void> queue(QueueContext context) override {
