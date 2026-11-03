@@ -47,6 +47,7 @@
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
+#include <unistd.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -59,8 +60,6 @@
 #include <kj/encoding.h>
 #include <kj/glob-filter.h>
 #include <kj/map.h>
-
-#include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -434,8 +433,8 @@ class Server::ActorNamespace final {
         clusterAlarmStore = kj::heap<ClusterAlarmStore>(as.vfs);
         alarmLeaderFile = as.directory->openFile(
             kj::Path({"alarm-leader"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
-        alarmLeaderTask = alarmLeaderLoop(kj::str(d.uniqueKey))
-                              .eagerlyEvaluate([](kj::Exception&& e) {
+        alarmLeaderTask =
+            alarmLeaderLoop(kj::str(d.uniqueKey)).eagerlyEvaluate([](kj::Exception&& e) {
           KJ_LOG(ERROR, "cluster alarm leader loop failed; alarms stop on this instance", e);
         });
         return;
@@ -1374,9 +1373,8 @@ class Server::ActorNamespace final {
                   return n.asPtr();
                 })}.clone();
                 sqliteHooks = kj::heap<ClusterActorSqliteHooks>(
-                    ns.clusterAlarmStore.map([](kj::Own<ClusterAlarmStore>& s) -> ClusterAlarmStore& {
-                  return *s;
-                }),
+                    ns.clusterAlarmStore.map(
+                        [](kj::Own<ClusterAlarmStore>& s) -> ClusterAlarmStore& { return *s; }),
                     kj::mv(actorKey));
               } else KJ_IF_SOME(a, ns.alarmScheduler) {
                 // clone() copies the id and name into storage owned by the returned ActorKey, so

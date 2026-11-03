@@ -159,7 +159,6 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
 
   int maxJitterMsForDelay(kj::Duration delay);
 
-
  public:
   static void ensureInitialized(SqliteDatabase& db);
 

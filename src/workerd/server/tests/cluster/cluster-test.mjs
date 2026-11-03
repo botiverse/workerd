@@ -520,112 +520,134 @@ test('cluster: draining node refuses to claim an unowned DO', async () => {
   });
 });
 
-test('cluster: alarms are rejected across machines (CIDR/NFS variant)', { skip: !NFS_VARIANT }, async () => {
-  await withCluster(1, async ({ nodes, sharedPath }) => {
-    // Fire the request. In cluster mode `setAlarm()` does not throw
-    // synchronously to the JS code -- the rejection happens during output-gate
-    // flush, after the worker's fetch handler has already returned. The
-    // observable behaviour is therefore a non-2xx HTTP status, while the
-    // canonical error message is logged to stderr where the test can detect
-    // it. (The spec mandates the message "Durable Object alarms are not yet
-    // supported in cluster mode".)
-    let response;
-    try {
-      response = await fetch(
-        `http://127.0.0.1:${nodes[0].httpPort}/set-alarm?name=alarm-test`
-      );
-    } catch (err) {
-      // A network-level failure is acceptable too: it confirms that the alarm
-      // path did not silently succeed.
-      response = null;
-    }
-    if (response !== null) {
-      // Drain the body to allow logging to flush.
+test(
+  'cluster: alarms are rejected across machines (CIDR/NFS variant)',
+  { skip: !NFS_VARIANT },
+  async () => {
+    await withCluster(1, async ({ nodes, sharedPath }) => {
+      // Fire the request. In cluster mode `setAlarm()` does not throw
+      // synchronously to the JS code -- the rejection happens during output-gate
+      // flush, after the worker's fetch handler has already returned. The
+      // observable behaviour is therefore a non-2xx HTTP status, while the
+      // canonical error message is logged to stderr where the test can detect
+      // it. (The spec mandates the message "Durable Object alarms are not yet
+      // supported in cluster mode".)
+      let response;
       try {
-        await response.text();
-      } catch (_) {
-        // ignore
+        response = await fetch(
+          `http://127.0.0.1:${nodes[0].httpPort}/set-alarm?name=alarm-test`
+        );
+      } catch (err) {
+        // A network-level failure is acceptable too: it confirms that the alarm
+        // path did not silently succeed.
+        response = null;
       }
-      assert.notStrictEqual(
-        Math.floor(response.status / 100),
-        2,
-        `expected non-2xx for set-alarm in cluster mode, got ${response.status}`
+      if (response !== null) {
+        // Drain the body to allow logging to flush.
+        try {
+          await response.text();
+        } catch (_) {
+          // ignore
+        }
+        assert.notStrictEqual(
+          Math.floor(response.status / 100),
+          2,
+          `expected non-2xx for set-alarm in cluster mode, got ${response.status}`
+        );
+      }
+
+      // Wait briefly for stderr to flush the error message.
+      const deadline = Date.now() + 5000;
+      const expectedMessage =
+        'Durable Object alarms are not yet supported in cluster mode';
+      while (
+        Date.now() < deadline &&
+        !nodes[0].stderr.includes(expectedMessage)
+      ) {
+        await sleep(50);
+      }
+      assert(
+        nodes[0].stderr.includes(expectedMessage),
+        `expected stderr to contain the cluster alarm rejection message ` +
+          `("${expectedMessage}"); stderr so far:\n${nodes[0].stderr}`
       );
-    }
 
-    // Wait briefly for stderr to flush the error message.
-    const deadline = Date.now() + 5000;
-    const expectedMessage =
-      'Durable Object alarms are not yet supported in cluster mode';
-    while (
-      Date.now() < deadline &&
-      !nodes[0].stderr.includes(expectedMessage)
-    ) {
-      await sleep(50);
-    }
-    assert(
-      nodes[0].stderr.includes(expectedMessage),
-      `expected stderr to contain the cluster alarm rejection message ` +
-        `("${expectedMessage}"); stderr so far:\n${nodes[0].stderr}`
-    );
-
-    // No per-namespace metadata.sqlite should exist anywhere under the
-    // shared directory -- across machines the AlarmScheduler is never
-    // constructed.
-    const nsDir = join(sharedPath, 'counter-test-namespace');
-    let entries = [];
-    try {
-      entries = await readdir(nsDir);
-    } catch (err) {
-      // Namespace dir might not exist if the DO was never created on disk
-      // because the request failed before storage was opened. That is a
-      // valid (and even stronger) signal that no metadata.sqlite was made.
-    }
-    assert(
-      !entries.some((name) => name.startsWith('metadata.sqlite')),
-      `cluster mode must not create metadata.sqlite; found: ${entries.join(', ')}`
-    );
-  });
-});
-
-test('cluster: an alarm runs once, delivered across instances (unix variant)', { skip: NFS_VARIANT }, async () => {
-  await withCluster(2, async ({ nodes, sharedPath }) => {
-    // Set the alarm through node 0 (which then holds the object), read it back
-    // through node 1 (forwarded to the holder) once it is due.
-    const set = await fetch(
-      `http://127.0.0.1:${nodes[0].httpPort}/set-alarm?name=alarm-test&ms=1000`
-    );
-    const setBody = await set.json();
-    assert.strictEqual(set.status, 200, JSON.stringify(setBody));
-
-    const deadline = Date.now() + 15000;
-    let state;
-    while (Date.now() < deadline) {
-      const r = await fetch(
-        `http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`
+      // No per-namespace metadata.sqlite should exist anywhere under the
+      // shared directory -- across machines the AlarmScheduler is never
+      // constructed.
+      const nsDir = join(sharedPath, 'counter-test-namespace');
+      let entries = [];
+      try {
+        entries = await readdir(nsDir);
+      } catch (err) {
+        // Namespace dir might not exist if the DO was never created on disk
+        // because the request failed before storage was opened. That is a
+        // valid (and even stronger) signal that no metadata.sqlite was made.
+      }
+      assert(
+        !entries.some((name) => name.startsWith('metadata.sqlite')),
+        `cluster mode must not create metadata.sqlite; found: ${entries.join(', ')}`
       );
-      state = await r.json();
-      if (state.fired.length > 0) break;
-      await sleep(200);
-    }
-    assert.strictEqual(state.fired.length, 1, `alarm should run once: ${JSON.stringify(state)}`);
-    assert.strictEqual(state.alarm, null, `no alarm left after the run: ${JSON.stringify(state)}`);
+    });
+  }
+);
 
-    // It must not run a second time (a stale table row is not re-run).
-    await sleep(3000);
-    const after = await (
-      await fetch(`http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`)
-    ).json();
-    assert.strictEqual(after.fired.length, 1, `alarm ran again: ${JSON.stringify(after)}`);
+test(
+  'cluster: an alarm runs once, delivered across instances (unix variant)',
+  { skip: NFS_VARIANT },
+  async () => {
+    await withCluster(2, async ({ nodes, sharedPath }) => {
+      // Set the alarm through node 0 (which then holds the object), read it back
+      // through node 1 (forwarded to the holder) once it is due.
+      const set = await fetch(
+        `http://127.0.0.1:${nodes[0].httpPort}/set-alarm?name=alarm-test&ms=1000`
+      );
+      const setBody = await set.json();
+      assert.strictEqual(set.status, 200, JSON.stringify(setBody));
 
-    // The shared alarm table exists (one per namespace, shared by all instances).
-    const entries = await readdir(join(sharedPath, 'counter-test-namespace'));
-    assert(
-      entries.some((name) => name === 'metadata.sqlite'),
-      `expected metadata.sqlite; found: ${entries.join(', ')}`
-    );
-  });
-});
+      const deadline = Date.now() + 15000;
+      let state;
+      while (Date.now() < deadline) {
+        const r = await fetch(
+          `http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`
+        );
+        state = await r.json();
+        if (state.fired.length > 0) break;
+        await sleep(200);
+      }
+      assert.strictEqual(
+        state.fired.length,
+        1,
+        `alarm should run once: ${JSON.stringify(state)}`
+      );
+      assert.strictEqual(
+        state.alarm,
+        null,
+        `no alarm left after the run: ${JSON.stringify(state)}`
+      );
+
+      // It must not run a second time (a stale table row is not re-run).
+      await sleep(3000);
+      const after = await (
+        await fetch(
+          `http://127.0.0.1:${nodes[1].httpPort}/alarm-state?name=alarm-test`
+        )
+      ).json();
+      assert.strictEqual(
+        after.fired.length,
+        1,
+        `alarm ran again: ${JSON.stringify(after)}`
+      );
+
+      // The shared alarm table exists (one per namespace, shared by all instances).
+      const entries = await readdir(join(sharedPath, 'counter-test-namespace'));
+      assert(
+        entries.some((name) => name === 'metadata.sqlite'),
+        `expected metadata.sqlite; found: ${entries.join(', ')}`
+      );
+    });
+  }
+);
 
 test('cluster: registry directory is populated for each running instance', async () => {
   await withCluster(2, async ({ nodes, sharedPath }) => {

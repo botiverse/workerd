@@ -310,10 +310,13 @@ kj::Promise<void> AlarmScheduler::abandonAlarm(kj::Own<ActorKey> actor, kj::Date
   }
   if (!notified) {
     if (clusterMode) {
+      // Don't move this task out of its own entry from inside the same turn it was resumed in.
+      co_await kj::yield();
       // The row is still in the shared table: forget the entry (a FINISHED entry with no task
       // would otherwise swallow later times for this actor) and let syncFromDb() deliver it again.
       KJ_IF_SOME(entry, alarms.findEntry(*actor)) {
-        if (entry.value.status == AlarmStatus::FINISHED && entry.value.scheduledTime == scheduledTime) {
+        if (entry.value.status == AlarmStatus::FINISHED &&
+            entry.value.scheduledTime == scheduledTime) {
           tasks.add(kj::mv(entry.value.task));
           alarms.erase(entry);
         }
