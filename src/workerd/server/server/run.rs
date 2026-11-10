@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -409,48 +410,10 @@ pub async fn run(
     match futures::future::select(serving, drain).await {
         Either::Left((result, _)) => result?,
         Either::Right(((), mut serving)) => {
-            // A draining instance claims nothing more. It keeps its lease while its running
-            // clustered objects' `drain()` methods flush them, so their commits are still
-            // acknowledged and no peer takes them over meanwhile. Then it lets its clustered
-            // objects go, `preventEviction` or not, and leaves the cluster, so peers take them
-            // over at their next listing while its connections finish. A request in flight on
-            // one could not commit anyway once a peer owns the object.
-            let mut served = false;
-            if let Some(node) = server.cluster() {
-                node.cluster.stop_claiming();
-                let workers = server
-                    .services()
-                    .filter_map(|(_, service)| service.as_worker());
-                let namespaces: Vec<_> = workers
-                    .flat_map(|worker| worker.namespaces())
-                    .filter(|(_, ns)| ns.cluster().is_some())
-                    .collect();
-                if !node.drain_timeout.is_zero() {
-                    // The listeners serve on meanwhile: their connections are driven by
-                    // `serving`. Only a listener's failure ends it before the drain signal.
-                    let flush = std::pin::pin!(drain_actors(&namespaces, node.drain_timeout));
-                    if let Either::Right((result, flush)) =
-                        futures::future::select(flush, serving.as_mut()).await
-                    {
-                        result?;
-                        served = true;
-                        flush.await;
-                    }
-                }
-                // TODO(cluster): release each drained object's owner record (node "") so that
-                // peers claim it at once, not once their listing drops this node (up to 3 s).
-                // Not at the end of its drain: the actor still serves reads here until
-                // `abort_all`, which a peer's new epoch would make stale. And even after it, the
-                // eviction its abort starts (`Owners::evict`) still tiers the object's log into
-                // the bucket while the peer recovers from it, a race nothing yet shows is safe.
-                node.cluster.start_draining();
-                for (_, namespace) in &namespaces {
-                    namespace.abort_all(None);
-                }
-                if let Err(e) = node.cluster.deregister().await {
-                    tracing::warn!("leaving the cluster: {e}");
-                }
-            }
+            let served = match server.cluster() {
+                Some(node) => leave_cluster(&server, node, serving.as_mut()).await?,
+                None => false,
+            };
             draining.send_replace(true);
             if !served {
                 serving.await?;
@@ -469,10 +432,64 @@ pub async fn run(
     Ok(ffi::factory_shutdown_containers(server.factory().raw()).await?)
 }
 
+/// A draining instance claims nothing more. It keeps its lease while the running objects of the
+/// clustered namespaces that opt in flush in their `drain()` methods, so their commits are still
+/// acknowledged and no peer takes them over meanwhile; `serving` drives the listeners meanwhile.
+/// Then it lets its clustered objects go, `preventEviction` or not, and leaves the cluster, so
+/// peers take them over at their next listing while its connections finish. A request in flight
+/// on one could not commit anyway once a peer owns the object.
+///
+/// Returns whether `serving` completed. A listener that fails meanwhile is the error, once the
+/// instance has left.
+async fn leave_cluster(
+    server: &Server,
+    node: &ClusterNode,
+    mut serving: Pin<&mut impl Future<Output = Result<()>>>,
+) -> Result<bool> {
+    node.cluster.stop_claiming();
+    let workers = server
+        .services()
+        .filter_map(|(_, service)| service.as_worker());
+    let namespaces: Vec<_> = workers
+        .flat_map(|worker| worker.namespaces())
+        .filter(|(_, ns)| ns.cluster().is_some())
+        .collect();
+    let draining: Vec<_> = namespaces.iter().filter(|(_, ns)| ns.drains()).collect();
+    let mut ended = false;
+    let mut failed = None;
+    if !node.drain_timeout.is_zero() && !draining.is_empty() {
+        // Only a listener's failure ends `serving` before the drain signal.
+        let flush = std::pin::pin!(drain_actors(&draining, node.drain_timeout));
+        if let Either::Right((result, flush)) =
+            futures::future::select(flush, serving.as_mut()).await
+        {
+            ended = true;
+            match result {
+                Ok(()) => flush.await,
+                Err(e) => failed = Some(e),
+            }
+        }
+    }
+    // TODO(cluster): release each drained object's owner record (node "") so that peers claim it
+    // at once, not once their listing drops this node (up to 3 s). Not at the end of its drain:
+    // the actor still serves reads here until `abort_all`, which a peer's new epoch would make
+    // stale. And even after it, the eviction its abort starts (`Owners::evict`) still tiers the
+    // object's log into the bucket while the peer recovers from it, a race nothing yet shows is
+    // safe.
+    node.cluster.start_draining();
+    for (_, namespace) in &namespaces {
+        namespace.abort_all(None);
+    }
+    if let Err(e) = node.cluster.deregister().await {
+        tracing::warn!("leaving the cluster: {e}");
+    }
+    failed.map_or(Ok(ended), Err)
+}
+
 /// Runs the `drain()` methods of the running actors of `namespaces`, every namespace's at once,
 /// for at most `timeout`, and logs what became of each namespace's: drained, without a `drain()`,
 /// failed, cut off at the deadline, and how long it took.
-async fn drain_actors(namespaces: &[(String, Rc<ActorNamespace>)], timeout: Duration) {
+async fn drain_actors(namespaces: &[&(String, Rc<ActorNamespace>)], timeout: Duration) {
     let drains = namespaces.iter().map(|(class, namespace)| async move {
         let started = std::time::Instant::now();
         let Drained {
@@ -482,8 +499,10 @@ async fn drain_actors(namespaces: &[(String, Rc<ActorNamespace>)], timeout: Dura
             timed_out,
         } = namespace.drain_all(timeout).await;
         let ms = started.elapsed().as_millis();
+        let service = namespace.service();
         if failed + timed_out > 0 {
             tracing::warn!(
+                service,
                 namespace = class.as_str(),
                 drained,
                 skipped,
@@ -494,6 +513,7 @@ async fn drain_actors(namespaces: &[(String, Rc<ActorNamespace>)], timeout: Dura
             );
         } else {
             tracing::info!(
+                service,
                 namespace = class.as_str(),
                 drained,
                 skipped,

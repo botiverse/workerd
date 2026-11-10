@@ -171,6 +171,16 @@ pub mod ffi {
         replicated: bool,
     }
 
+    /// Whether a running actor's instance has a `drain()` method, as far as can be told without
+    /// a request on it (`actor_drain_method`).
+    #[repr(u8)]
+    enum DrainMethod {
+        Some,
+        None,
+        /// Only a request on the actor can tell: it is still being constructed, or failed to be.
+        Unknown,
+    }
+
     /// What an alarm does when another instance owns its object: runs again later, a retry
     /// that counts against no limit, or is done.
     #[repr(u8)]
@@ -397,6 +407,9 @@ pub mod ffi {
         /// one, then waits for what it wrote to be durable. Returns whether it had one; an error
         /// is the method's failure, which the actor's own logs report.
         async fn worker_drain(worker: KjOwn<WorkerInterface>) -> Result<bool>;
+        /// Whether the actor's instance has a `drain()` method, looked up under the isolate lock
+        /// but outside any request, so not behind the actor's input gate.
+        async fn actor_drain_method(actor: &ActorHandle) -> Result<DrainMethod>;
         /// Constructs an actor of `class_name` whose storage lives in `storage`. `hooks` is the
         /// actor's way back to the server; `hibernation_manager` is the evicted predecessor's,
         /// whose WebSockets the actor adopts. `container` gives the actor its container's Docker

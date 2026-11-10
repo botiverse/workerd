@@ -74,6 +74,7 @@ fn actor_configs_read_durable_and_ephemeral_namespaces() {
             enable_sql: true,
             workflow: None,
             container: None,
+            drain: false,
         })
     );
     assert_eq!(

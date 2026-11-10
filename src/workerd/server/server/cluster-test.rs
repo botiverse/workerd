@@ -69,3 +69,10 @@ fn a_disconnected_session_is_forgotten() {
         Ok(2)
     );
 }
+
+#[test]
+fn a_drain_timeout_is_at_most_ten_seconds() {
+    assert_eq!(drain_timeout(0), Duration::ZERO);
+    assert_eq!(drain_timeout(6_000), Duration::from_secs(6));
+    assert_eq!(drain_timeout(60_000), Duration::from_secs(10));
+}

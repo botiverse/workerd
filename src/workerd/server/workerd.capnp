@@ -161,10 +161,11 @@ struct ClusterConfig {
   # How long a draining instance (SIGTERM) gives its running Durable Objects to flush before it
   # lets them go. It first stops claiming objects, keeping its lease, so the objects it owns stay
   # its own and their writes are still acknowledged; then calls the `drain()` method of each
-  # running Durable Object whose class defines one, all at once, and waits for them, and for what
-  # they wrote to be durable, for at most this long. Then it lets its objects go and leaves the
-  # cluster, as it does without a `drain()`. 0 skips the `drain()` calls. Keep it well within the
-  # time the instance has to exit after SIGTERM, and under the lease (20 s).
+  # running Durable Object of the namespaces that opt in (`DurableObjectNamespace.drain`) whose
+  # class defines one, and waits for them, and for what they wrote to be durable, for at most this
+  # long. Then it lets its objects go and leaves the cluster. 0 skips the `drain()` calls; more
+  # than 10000 is taken as 10000. Keep it well within the time the instance has to exit after
+  # SIGTERM.
 }
 
 struct LoggingOptions {
@@ -800,6 +801,13 @@ struct Worker {
     # workerd uses SQLite to back all Durable Objects, but the SQL API is hidden by default to
     # emulate behavior of traditional DO namespaces on Cloudflare that aren't SQLite-backed. This
     # flag should be enabled when testing code that will run on a SQLite-backed namespace.
+
+    drain @6 :Bool = false;
+    # In cluster mode (`Config.cluster`), call the `drain()` method of each of this namespace's
+    # Durable Objects running on an instance as that instance drains (SIGTERM), while it still owns
+    # them, so that they can write out what they keep in memory: see `ClusterConfig.drainTimeoutMs`.
+    # Off by default, so that a class's own method named `drain` is not called by surprise. Objects
+    # whose class has no `drain()` method are skipped.
 
     container @5 :ContainerOptions;
     # If present, Durable Objects in this namespace have attached containers.

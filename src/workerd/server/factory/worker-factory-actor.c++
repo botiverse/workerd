@@ -497,7 +497,8 @@ class DrainCustomEvent final: public WorkerInterface::CustomEvent {
         }
         return kj::READY_NOW;
       });
-      co_await context.waitForOutputLocks();
+      // Nothing to wait for from an actor whose method did not run.
+      if (ran) co_await context.waitForOutputLocks();
     } catch (kj::Exception& e) {
       incomingRequest->getMetrics().reportFailure(e);
       context.logUncaughtExceptionAsync(
@@ -845,6 +846,33 @@ void actor_close_storage(const ActorHandle& actor) {
 kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandle& actor) {
   return actor.getActor().getHibernationManager().map(
       [](HibernationManager& m) { return kj::Rc<HibernationManager>(m.addRef()); });
+}
+
+kj::Promise<DrainMethod> actor_drain_method(const ActorHandle& handle) {
+  auto& actor = handle.getActor();
+  auto asyncLock = co_await actor.getWorker().takeAsyncLockWithoutRequest(nullptr);
+  // An actor still being constructed, or whose construction failed, can only tell in a request.
+  auto method = DrainMethod::Unknown;
+  actor.getWorker().runInLockScope(asyncLock, [&](Worker::Lock& lock) {
+    JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+      kj::runCatchingExceptions([&]() {
+        // The constructed instance; outside a request, anything else throws.
+        KJ_IF_SOME(handler,
+            lock.getExportedHandler(kj::none, kj::none, Frankenvalue(), actor, false)) {
+          auto self = jsg::JsObject(handler->self.getHandle(js));
+          // A getter or a Proxy trap that throws leaves it to the request.
+          method = js.tryCatch([&] {
+            return self.get(js, "drain"_kj).tryCast<jsg::JsFunction>() == kj::none
+                ? DrainMethod::None
+                : DrainMethod::Some;
+          }, [&](jsg::Value) { return DrainMethod::Unknown; });
+        } else {
+          method = DrainMethod::None;
+        }
+      });
+    });
+  });
+  co_return method;
 }
 
 kj::Promise<bool> worker_drain(kj::Own<WorkerInterface> worker) {
