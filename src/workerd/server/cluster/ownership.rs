@@ -79,6 +79,9 @@ pub struct Ownership {
     registry: Rc<Registry>,
     /// Whether this instance may claim objects: off once it drains.
     pub may_claim: Cell<bool>,
+    /// Whether this instance still takes up the objects its owner records
+    /// name, while it holds its lease: off once it lets them go.
+    pub may_keep: Cell<bool>,
     /// Where each routed object's owner was, and when that was read.
     routes: RefCell<HashMap<String, Route>>,
     /// The record each claim wrote, and the guard that it is still the
@@ -119,6 +122,7 @@ impl Ownership {
             bucket,
             registry,
             may_claim: Cell::new(true),
+            may_keep: Cell::new(true),
             routes: RefCell::new(HashMap::new()),
             claimed: RefCell::new(HashMap::new()),
         }
@@ -163,8 +167,9 @@ impl Ownership {
                 Some((body, version)) => {
                     let record: OwnerRecord = serde_json::from_slice(&body)?;
                     if record.node == me {
-                        // A draining node lets its objects go, its own too.
-                        if !self.may_claim.get() {
+                        // A node that stopped claiming still wakes what it
+                        // owns, until it lets its objects go.
+                        if !self.may_keep.get() {
                             return Err(draining(&key));
                         }
                         return Ok(Claim::Owned(record.owned()));

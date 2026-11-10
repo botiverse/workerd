@@ -390,7 +390,8 @@ impl Cluster {
 
     /// Stops claiming before the claim reaches the bucket, but keeps the
     /// lease: the objects this node owns stay its own, their commits still
-    /// acknowledged, while they flush before `start_draining`.
+    /// acknowledged, while they flush before `start_draining`. One its record
+    /// names that is not open here still opens here.
     pub fn stop_claiming(&self) {
         self.ownership.may_claim.set(false);
     }
@@ -400,6 +401,7 @@ impl Cluster {
     pub fn start_draining(&self) {
         self.lease.borrow_mut().draining = true;
         self.ownership.may_claim.set(false);
+        self.ownership.may_keep.set(false);
     }
 
     /// The first renewal, before the node serves.
@@ -499,14 +501,19 @@ mod tests {
             assert!(!a.lease.borrow().draining);
             a.renew(now_ms()).await.unwrap();
             assert!(a.lease_holds());
-            // so a peer routes to what it owns rather than claiming it.
+            // so a peer routes to what it owns rather than claiming it,
             match b.acquire_or_route("ns", "kept", now_ms()).await.unwrap() {
                 Route::Remote { node, .. } => assert_eq!(node, "a"),
                 Route::Owned(_) => panic!("a peer claimed an object of a live node"),
             }
+            // and it still takes up what it owns.
+            let again = a.acquire_or_route("ns", "kept", now_ms()).await.unwrap();
+            assert!(matches!(again, Route::Owned(_)));
 
+            // Draining, it lets its objects go, its own too.
             a.start_draining();
             assert!(a.lease.borrow().draining);
+            assert!(a.acquire_or_route("ns", "kept", now_ms()).await.is_err());
         });
     }
 
