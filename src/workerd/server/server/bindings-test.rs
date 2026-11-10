@@ -54,6 +54,7 @@ fn durable(unique_key: &str) -> ActorConfig {
         enable_sql: true,
         workflow: None,
         container: None,
+        drain: false,
     }
 }
 

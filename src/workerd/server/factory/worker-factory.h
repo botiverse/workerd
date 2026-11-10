@@ -99,6 +99,7 @@ struct ActorStorageSpec;
 struct HeaderEdit;
 struct UdpDatagram;
 enum class AlarmElsewhere : uint8_t;
+enum class DrainMethod : uint8_t;
 
 // How the config message is read: configs can legitimately be very large and are not malicious.
 constexpr capnp::ReaderOptions CONFIG_READER_OPTIONS = {.traversalLimitInWords = kj::maxValue};
@@ -217,6 +218,8 @@ kj::Own<WorkerInterface> worker_interface_attach(
     kj::Own<WorkerInterface> inner, ::rust::Box<KeepAlive> keep);
 kj::Promise<::rust::Vec<uint64_t>> worker_bench(
     kj::Own<WorkerInterface> worker, ::rust::Slice<const uint64_t> params);
+kj::Promise<bool> worker_drain(kj::Own<WorkerInterface> worker);
+kj::Promise<DrainMethod> actor_drain_method(const ActorHandle& actor);
 kj::Own<ActorHandle> worker_new_actor(const CompiledWorker& worker,
     ::rust::Str className,
     kj::Maybe<kj::Own<Frankenvalue>> props,

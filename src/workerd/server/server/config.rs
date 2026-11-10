@@ -440,6 +440,7 @@ pub fn collect_actor_configs(
                                     service_index,
                                     namespace_index,
                                 }),
+                                drain: ns.get_drain(),
                             },
                         );
                     }
@@ -611,21 +612,12 @@ fn collect_workflow_configs(
         for error in errors {
             report.service_error(name, error);
         }
-        configs.insert(
-            key.clone(),
-            ActorConfig::Durable {
-                unique_key: key,
-                // Workflow actors must not be evicted mid-run, and their state is SQL-backed.
-                evictable: false,
-                enable_sql: true,
-                workflow: Some(Box::new(Workflow {
-                    name: workflow_name,
-                    class_name,
-                    binding_service,
-                })),
-                container: None,
-            },
-        );
+        let workflow = Workflow {
+            name: workflow_name,
+            class_name,
+            binding_service,
+        };
+        configs.insert(key.clone(), ActorConfig::workflow(key, workflow));
     }
     Ok(())
 }

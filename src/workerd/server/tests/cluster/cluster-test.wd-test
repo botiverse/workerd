@@ -26,10 +26,16 @@ const config :Workerd.Config = (
         compatibilityFlags = ["nodejs_compat", "allow_irrevocable_stub_storage"],
         bindings = [
           ( name = "COUNTER", durableObjectNamespace = "Counter" ),
+          ( name = "NO_DRAIN", durableObjectNamespace = "NoDrain" ),
+          ( name = "UNOPTED", durableObjectNamespace = "Unopted" ),
           ( name = "NODE_ID", fromEnvironment = "NODE_ID" ),
         ],
         durableObjectNamespaces = [
-          ( className = "Counter", uniqueKey = "counter-test-namespace" ),
+          ( className = "Counter", uniqueKey = "counter-test-namespace", drain = true ),
+          # Opted in, with a class that has no drain().
+          ( className = "NoDrain", uniqueKey = "no-drain-test-namespace", drain = true ),
+          # A Counter, with its drain(), in a namespace that does not opt in.
+          ( className = "Unopted", uniqueKey = "unopted-test-namespace" ),
         ],
         durableObjectStorage = ( localDisk = "local" ),
       )
@@ -49,5 +55,7 @@ const config :Workerd.Config = (
     ],
     address = "127.0.0.1:0",
     key = "test-cluster-shared-secret-of-32-bytes",
+    # Shorter than the default, so that a drain cut off at it is quick to test.
+    drainTimeoutMs = 3000,
   ),
 );

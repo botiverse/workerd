@@ -118,11 +118,28 @@ pub enum ActorConfig {
         workflow: Option<Box<Workflow>>,
         /// Where the config has the class's `container` options, if it has any.
         container: Option<crate::bridge::ffi::ContainerRef>,
+        /// Whether a draining cluster instance calls its actors' `drain()` (`drain`).
+        drain: bool,
     },
     Ephemeral {
         evictable: bool,
         enable_sql: bool,
     },
+}
+
+impl ActorConfig {
+    /// The namespace synthesized to back `workflow`, keyed `unique_key`.
+    pub fn workflow(unique_key: String, workflow: Workflow) -> Self {
+        Self::Durable {
+            unique_key,
+            // Workflow actors must not be evicted mid-run, and their state is SQL-backed.
+            evictable: false,
+            enable_sql: true,
+            workflow: Some(Box::new(workflow)),
+            container: None,
+            drain: false,
+        }
+    }
 }
 
 /// One worker's namespaces by class name, in config order.

@@ -5,6 +5,7 @@
 #include "worker-factory-impl.h"
 
 #include <workerd/api/actor-state.h>
+#include <workerd/api/global-scope.h>
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/io-context.h>
 #include <workerd/server/actor-id-impl.h>
@@ -458,6 +459,80 @@ class ActorHooksImpl final: public Worker::Actor::Loopback,
   }
 };
 
+// A draining cluster instance's call of an actor's `drain()` method, the actor's chance to flush
+// what it keeps in memory while the instance still owns it. A class without the method gets nothing
+// (`ran` stays false). The event completes once what the method wrote is durable: in a cluster, a
+// commit is durable once the bucket has it.
+class DrainCustomEvent final: public WorkerInterface::CustomEvent {
+ public:
+  explicit DrainCustomEvent(bool& ran): ran(ran) {}
+
+  kj::Promise<Result> run(kj::Own<IoContext_IncomingRequest> incomingRequest,
+      kj::Maybe<kj::StringPtr> entrypointName,
+      kj::Maybe<Worker::VersionInfo> versionInfo,
+      Frankenvalue props,
+      kj::TaskSet& waitUntilTasks,
+      bool isDynamicDispatch) override {
+    auto& context = incomingRequest->getContext();
+    incomingRequest->delivered("drain"_kj);
+    KJ_DEFER({ incomingRequest->drain(waitUntilTasks, kj::mv(incomingRequest)); });
+
+    EventOutcome outcome = EventOutcome::OK;
+    try {
+      co_await context.run([this, entrypointName, versionInfo = kj::mv(versionInfo),
+                               props = kj::mv(props), isDynamicDispatch](
+                               Worker::Lock& lock, IoContext& ioctx) mutable -> kj::Promise<void> {
+        KJ_IF_SOME(handler,
+            lock.getExportedHandler(entrypointName, kj::mv(versionInfo), kj::mv(props),
+                ioctx.getActor(), isDynamicDispatch)) {
+          jsg::Lock& js = lock;
+          auto self = jsg::JsObject(handler->self.getHandle(js));
+          KJ_IF_SOME(method, self.get(js, "drain"_kj).tryCast<jsg::JsFunction>()) {
+            ran = true;
+            v8::LocalVector<v8::Value> args(js.v8Isolate);
+            return ioctx.awaitJs(js, js.tryCatch([&] {
+              return js.toVoidPromise(method.call(js, self, args));
+            }, [&](jsg::Value exception) { return js.rejectedPromise<void>(kj::mv(exception)); }));
+          }
+        }
+        return kj::READY_NOW;
+      });
+      // Nothing to wait for from an actor whose method did not run.
+      if (ran) co_await context.waitForOutputLocks();
+    } catch (kj::Exception& e) {
+      incomingRequest->getMetrics().reportFailure(e);
+      context.logUncaughtExceptionAsync(
+          UncaughtExceptionSource::ASYNC_TASK, e.clone(), *incomingRequest);
+      outcome = EventOutcome::EXCEPTION;
+    }
+    co_return Result{.outcome = outcome};
+  }
+
+  kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory&,
+      capnp::ByteStreamFactory&,
+      FrankenvalueHandler&,
+      rpc::EventDispatcher::Client) override {
+    // An instance drains only the actors it runs.
+    KJ_FAIL_REQUIRE("a drain does not cross between instances");
+  }
+
+  kj::Promise<Result> notSupported() override {
+    KJ_FAIL_REQUIRE("the target does not take a drain");
+  }
+
+  uint16_t getType() override {
+    // Defined here: the event never leaves workerd.
+    return 0x8001;
+  }
+
+  tracing::EventInfo getEventInfo() const override {
+    return tracing::CustomEventInfo();
+  }
+
+ private:
+  bool& ran;
+};
+
 // Schedules a root actor's alarms with the namespace's scheduler, at once, and in a cluster indexes
 // them after `priorTask`, as production's alarm manager orders its requests: the index takes them
 // in the order they were made.
@@ -771,6 +846,59 @@ void actor_close_storage(const ActorHandle& actor) {
 kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandle& actor) {
   return actor.getActor().getHibernationManager().map(
       [](HibernationManager& m) { return kj::Rc<HibernationManager>(m.addRef()); });
+}
+
+kj::Promise<DrainMethod> actor_drain_method(const ActorHandle& handle) {
+  auto& actor = handle.getActor();
+  auto asyncLock = co_await actor.getWorker().takeAsyncLockWithoutRequest(nullptr);
+  // An actor still being constructed, or whose construction failed, can only tell in a request.
+  auto method = DrainMethod::Unknown;
+  actor.getWorker().runInLockScope(asyncLock, [&](Worker::Lock& lock) {
+    JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+      kj::runCatchingExceptions([&]() {
+        // The constructed instance; outside a request, anything else throws.
+        KJ_IF_SOME(handler,
+            lock.getExportedHandler(kj::none, kj::none, Frankenvalue(), actor, false)) {
+          // Only a data property that is a function counts, found along the prototype chain
+          // without running the app's code: an accessor or a Proxy leaves it to the request.
+          method = js.tryCatch([&] {
+            auto context = js.v8Context();
+            v8::Local<v8::String> name = js.strIntern("drain"_kj);
+            v8::Local<v8::String> get = js.strIntern("get"_kj);
+            v8::Local<v8::String> set = js.strIntern("set"_kj);
+            v8::Local<v8::String> value = js.strIntern("value"_kj);
+            v8::Local<v8::Value> current = handler->self.getHandle(js);
+            for (auto depth = 0; depth < 64 && current->IsObject(); ++depth) {
+              auto object = current.As<v8::Object>();
+              if (object->IsProxy()) return DrainMethod::Unknown;
+              auto descriptor = jsg::check(object->GetOwnPropertyDescriptor(context, name));
+              if (descriptor->IsObject()) {
+                auto fields = descriptor.As<v8::Object>();
+                if (jsg::check(fields->HasOwnProperty(context, get)) ||
+                    jsg::check(fields->HasOwnProperty(context, set))) {
+                  return DrainMethod::Unknown;
+                }
+                return jsg::check(fields->Get(context, value))->IsFunction() ? DrainMethod::Some
+                                                                             : DrainMethod::None;
+              }
+              current = object->GetPrototype();
+            }
+            return current->IsNull() ? DrainMethod::None : DrainMethod::Unknown;
+          }, [&](jsg::Value) { return DrainMethod::Unknown; });
+        } else {
+          method = DrainMethod::None;
+        }
+      });
+    });
+  });
+  co_return method;
+}
+
+kj::Promise<bool> worker_drain(kj::Own<WorkerInterface> worker) {
+  bool ran = false;
+  auto result = co_await worker->customEvent(kj::heap<DrainCustomEvent>(ran));
+  KJ_REQUIRE(result.outcome == EventOutcome::OK, "the Durable Object's drain() failed");
+  co_return ran;
 }
 
 kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start) {

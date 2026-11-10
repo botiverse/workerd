@@ -68,6 +68,8 @@ pub struct ClusterNode {
     nonces: RefCell<HashMap<String, u64>>,
     /// The clustered namespaces, by their part of the bucket's keys.
     namespaces: RefCell<HashMap<String, Weak<ActorNamespace>>>,
+    /// How long a drain waits for the actors' `drain()` methods (`drainTimeoutMs`).
+    pub drain_timeout: Duration,
 }
 
 /// How often an instance tidies its alarm index and adopts dead peers' alarms.
@@ -154,6 +156,21 @@ pub async fn bind(
     Ok((listener, advertise))
 }
 
+/// The longest `drainTimeoutMs` honored: a drain longer than this mostly outlasts what a
+/// supervisor waits after SIGTERM.
+const MAX_DRAIN_TIMEOUT_MS: u32 = 10_000;
+
+/// `drainTimeoutMs`, at most `MAX_DRAIN_TIMEOUT_MS`.
+fn drain_timeout(ms: u32) -> Duration {
+    if ms > MAX_DRAIN_TIMEOUT_MS {
+        tracing::warn!(
+            "cluster.drainTimeoutMs {ms} is more than {MAX_DRAIN_TIMEOUT_MS}; using \
+             {MAX_DRAIN_TIMEOUT_MS}"
+        );
+    }
+    Duration::from_millis(ms.min(MAX_DRAIN_TIMEOUT_MS).into())
+}
+
 /// Fails for an `address` that is a public IP, unless the config allows it.
 fn refuse_public(conf: cluster_config::Reader<'_>, address: &str) -> Result<()> {
     let Ok(ip) = address.parse::<std::net::SocketAddr>().map(|a| a.ip()) else {
@@ -216,6 +233,7 @@ impl ClusterNode {
             advertise: address,
             nonces: RefCell::default(),
             namespaces: RefCell::default(),
+            drain_timeout: drain_timeout(conf.get_drain_timeout_ms()),
         }))
     }
 
