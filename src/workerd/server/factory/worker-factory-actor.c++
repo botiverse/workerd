@@ -859,12 +859,31 @@ kj::Promise<DrainMethod> actor_drain_method(const ActorHandle& handle) {
         // The constructed instance; outside a request, anything else throws.
         KJ_IF_SOME(handler,
             lock.getExportedHandler(kj::none, kj::none, Frankenvalue(), actor, false)) {
-          auto self = jsg::JsObject(handler->self.getHandle(js));
-          // A getter or a Proxy trap that throws leaves it to the request.
+          // Only a data property that is a function counts, found along the prototype chain
+          // without running the app's code: an accessor or a Proxy leaves it to the request.
           method = js.tryCatch([&] {
-            return self.get(js, "drain"_kj).tryCast<jsg::JsFunction>() == kj::none
-                ? DrainMethod::None
-                : DrainMethod::Some;
+            auto context = js.v8Context();
+            v8::Local<v8::String> name = js.strIntern("drain"_kj);
+            v8::Local<v8::String> get = js.strIntern("get"_kj);
+            v8::Local<v8::String> set = js.strIntern("set"_kj);
+            v8::Local<v8::String> value = js.strIntern("value"_kj);
+            v8::Local<v8::Value> current = handler->self.getHandle(js);
+            for (auto depth = 0; depth < 64 && current->IsObject(); ++depth) {
+              auto object = current.As<v8::Object>();
+              if (object->IsProxy()) return DrainMethod::Unknown;
+              auto descriptor = jsg::check(object->GetOwnPropertyDescriptor(context, name));
+              if (descriptor->IsObject()) {
+                auto fields = descriptor.As<v8::Object>();
+                if (jsg::check(fields->HasOwnProperty(context, get)) ||
+                    jsg::check(fields->HasOwnProperty(context, set))) {
+                  return DrainMethod::Unknown;
+                }
+                return jsg::check(fields->Get(context, value))->IsFunction() ? DrainMethod::Some
+                                                                             : DrainMethod::None;
+              }
+              current = object->GetPrototype();
+            }
+            return current->IsNull() ? DrainMethod::None : DrainMethod::Unknown;
           }, [&](jsg::Value) { return DrainMethod::Unknown; });
         } else {
           method = DrainMethod::None;

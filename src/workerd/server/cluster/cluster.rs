@@ -180,8 +180,13 @@ impl Cluster {
         }
         Ok(match claim {
             Claim::Owned(owned) => {
-                let epoch = owned.epoch;
                 let key = format!("{ns}/{actor}");
+                // The node may have started draining while the claim awaited the bucket: then
+                // its objects are being let go, and one opened now would outlive that.
+                if !self.ownership.may_keep.get() {
+                    return Err(crate::ownership::draining(&key));
+                }
+                let epoch = owned.epoch;
                 self.claims.borrow_mut().insert(key, owned);
                 Route::Owned(epoch)
             }
@@ -459,6 +464,8 @@ async fn check_conditional_writes(bucket: &Bucket, node: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     use cluster_logic::lease;
@@ -471,6 +478,51 @@ mod tests {
     use super::now_ms;
     use crate::Bucket;
     use crate::bucket::memory::Memory;
+
+    /// A memory bucket that runs `hook` as it serves the `nth` read of an
+    /// owner record, from 1.
+    struct Hooked {
+        inner: Memory,
+        nth: Cell<usize>,
+        hook: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::Store for Rc<Hooked> {
+        async fn get(
+            &self,
+            key: &str,
+            to: Option<&std::path::Path>,
+        ) -> crate::Result<Option<(Vec<u8>, crate::Version)>> {
+            if key.ends_with("own.json") {
+                self.nth.set(self.nth.get().saturating_sub(1));
+                if self.nth.get() == 0
+                    && let Some(hook) = self.hook.borrow_mut().take()
+                {
+                    hook();
+                }
+            }
+            self.inner.get(key, to).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            body: crate::bucket::Payload,
+            guard: Option<crate::Guard>,
+            metadata: &[(&str, String)],
+        ) -> crate::Result<Option<crate::Version>> {
+            self.inner.put(key, body, guard, metadata).await
+        }
+
+        async fn list(&self, prefix: &str) -> crate::Result<Vec<crate::bucket::Entry>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> crate::Result<()> {
+            self.inner.delete(key).await
+        }
+    }
 
     fn node(bucket: &Bucket, name: &str) -> Rc<Cluster> {
         let setup = Setup {
@@ -513,6 +565,33 @@ mod tests {
             // Draining, it lets its objects go, its own too.
             a.start_draining();
             assert!(a.lease.borrow().draining);
+            assert!(a.acquire_or_route("ns", "kept", now_ms()).await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_node_that_starts_draining_mid_claim_does_not_keep_the_object() {
+        block_on(async {
+            let hooked = Rc::new(Hooked {
+                inner: Memory::default(),
+                nth: Cell::new(usize::MAX),
+                hook: RefCell::new(None),
+            });
+            let bucket = Bucket::new(Rc::clone(&hooked), "");
+            let a = node(&bucket, "a");
+            a.join().await.unwrap();
+            let kept = a.acquire_or_route("ns", "kept", now_ms()).await.unwrap();
+            assert!(matches!(kept, Route::Owned(_)));
+            // Not open here any more: taking it up again moves it to the
+            // next epoch.
+            a.close_actor("ns", "kept");
+            a.stop_claiming();
+
+            // That reads its record twice: to find it is this node's, then
+            // to advance it. The drain starts between the two.
+            let drainer = Rc::clone(&a);
+            *hooked.hook.borrow_mut() = Some(Box::new(move || drainer.start_draining()));
+            hooked.nth.set(2);
             assert!(a.acquire_or_route("ns", "kept", now_ms()).await.is_err());
         });
     }

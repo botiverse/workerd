@@ -108,7 +108,7 @@ const ROUTE_REFRESH_MS: u64 = 5_000;
 /// How many times a claim retries when another instance keeps winning.
 const ATTEMPTS: usize = 8;
 
-fn draining(key: &str) -> Error {
+pub fn draining(key: &str) -> Error {
     Error::Replica(format!("{key}: this node is draining"))
 }
 
