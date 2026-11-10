@@ -69,6 +69,12 @@
 //   /set-go          Sets this DO's `go` flag (read by Consumer via /get).
 //   /record?value=V  Stores V (JSON) as this DO's `recorded` value.
 //
+// Drain paths (see drain()):
+//   /buffer          Adds 1 to a count this instance keeps in memory only, which
+//                    its drain() adds to `buffered` in storage. /get returns
+//                    `buffered`.
+//   /hang-drain      Makes this instance's drain() never finish.
+//
 // The top-level fetch() additionally honors a `delay` query parameter (ms): it
 // waits that long *before* calling the DO. This lets a test put a request in
 // flight on a node and SIGTERM that node while the request has not yet routed
@@ -193,6 +199,9 @@ export class Counter extends DurableObject {
     this.env = env;
     // See /hold-stub. Maps target DO name -> stub.
     this.heldStubs = new Map();
+    // See /buffer and /hang-drain.
+    this.buffered = 0;
+    this.hangDrain = false;
 
     state.blockConcurrencyWhile(async () => {
       if (await state.storage.get(BREAK_ON_CONSTRUCT)) {
@@ -224,11 +233,13 @@ export class Counter extends DurableObject {
       const restores = (await this.state.storage.get('restores')) ?? 0;
       const go = (await this.state.storage.get('go')) ?? false;
       const recorded = await this.state.storage.get('recorded');
+      const buffered = (await this.state.storage.get('buffered')) ?? 0;
       return Response.json({
         count,
         restores,
         go,
         recorded,
+        buffered,
         nodeId,
         id: idHex,
       });
@@ -312,6 +323,12 @@ export class Counter extends DurableObject {
         JSON.parse(url.searchParams.get('value'))
       );
       return Response.json({ nodeId, id: idHex });
+    } else if (url.pathname === '/buffer') {
+      this.buffered += 1;
+      return Response.json({ nodeId, id: idHex, buffered: this.buffered });
+    } else if (url.pathname === '/hang-drain') {
+      this.hangDrain = true;
+      return Response.json({ nodeId, id: idHex });
     } else if (url.pathname === '/hold') {
       await scheduler.wait(1000);
       return Response.json({ nodeId, id: idHex });
@@ -356,6 +373,19 @@ export class Counter extends DurableObject {
     const fired = (await this.state.storage.get('fired')) ?? [];
     fired.push(this.env.NODE_ID);
     await this.state.storage.put('fired', fired);
+  }
+
+  // Called once as this instance drains (SIGTERM), while it still owns the DO:
+  // writes what /buffer kept in memory, and after /hang-drain never finishes.
+  async drain() {
+    if (this.buffered > 0) {
+      const buffered = (await this.state.storage.get('buffered')) ?? 0;
+      await this.state.storage.put('buffered', buffered + this.buffered);
+      this.buffered = 0;
+    }
+    if (this.hangDrain) {
+      await new Promise(() => {});
+    }
   }
 
   // RPC method used by /vend-stub on the *target* DO.

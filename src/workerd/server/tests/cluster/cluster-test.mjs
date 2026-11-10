@@ -658,6 +658,86 @@ test(
   }
 );
 
+// `drainTimeoutMs` in cluster-test.wd-test.
+const DRAIN_TIMEOUT_MS = 3000;
+
+// The response to `path` from `node` once it serves it, within `withinMs`:
+// a peer routes to a departed owner until its listing drops it.
+async function fetchOnceServed(node, path, withinMs = 10_000) {
+  const deadline = Date.now() + withinMs;
+  let response = null;
+  while (Date.now() < deadline) {
+    response = await fetchJson(node.httpPort, path, {
+      timeoutMs: Math.max(deadline - Date.now(), 1),
+    }).catch(() => null);
+    if (response?.status === 200) return response;
+    await sleep(200);
+  }
+  assert.fail(`${path} not served: ${JSON.stringify(response?.body)}`);
+}
+
+test(
+  "cluster: a draining owner's DO flushes in drain(), and the next owner sees it",
+  SIGTERM_DRAINS,
+  async () => {
+    await withCluster(2, async ({ nodes }) => {
+      const first = await fetchJson(nodes[0].httpPort, '/increment?name=flush');
+      assert.strictEqual(first.status, 200, JSON.stringify(first.body));
+      const owner = nodes.find((n) => n.nodeId === first.body.nodeId);
+      const peer = nodes.find((n) => n.nodeId !== first.body.nodeId);
+      for (let i = 1; i <= 3; i++) {
+        const buffered = await fetchJson(owner.httpPort, '/buffer?name=flush');
+        assert.strictEqual(buffered.body.buffered, i);
+      }
+
+      // Kept in memory only, until the owner drains.
+      const exit = await owner.stop({ signal: 'SIGTERM', timeoutMs: 20_000 });
+      assert.deepStrictEqual(exit, { code: 0, signal: null });
+      assert.match(owner.stderr, /cluster drain.*drained = 1/);
+      assert.match(owner.stderr, /cluster drain.*timed_out = 0/);
+
+      const after = await fetchOnceServed(peer, '/get?name=flush');
+      assert.strictEqual(after.body.nodeId, peer.nodeId);
+      assert.strictEqual(after.body.count, 1);
+      assert.strictEqual(after.body.buffered, 3);
+    });
+  }
+);
+
+test(
+  'cluster: a drain() that does not finish is cut off at the deadline',
+  SIGTERM_DRAINS,
+  async () => {
+    await withCluster(2, async ({ nodes }) => {
+      const first = await fetchJson(nodes[0].httpPort, '/increment?name=hang');
+      assert.strictEqual(first.status, 200, JSON.stringify(first.body));
+      const owner = nodes.find((n) => n.nodeId === first.body.nodeId);
+      const peer = nodes.find((n) => n.nodeId !== first.body.nodeId);
+      const buffered = await fetchJson(owner.httpPort, '/buffer?name=hang');
+      assert.strictEqual(buffered.status, 200);
+      const hung = await fetchJson(owner.httpPort, '/hang-drain?name=hang');
+      assert.strictEqual(hung.status, 200);
+
+      const signalled = Date.now();
+      const exit = await owner.stop({ signal: 'SIGTERM', timeoutMs: 20_000 });
+      const elapsed = Date.now() - signalled;
+      assert.deepStrictEqual(exit, { code: 0, signal: null });
+      assert(
+        elapsed >= DRAIN_TIMEOUT_MS - 100 && elapsed < DRAIN_TIMEOUT_MS + 5000,
+        `exited ${elapsed} ms after SIGTERM`
+      );
+      assert.match(owner.stderr, /cluster drain.*timed_out = 1/);
+
+      // What drain() wrote before it hung, committed long before the deadline
+      // while the owner kept its lease, is the next owner's.
+      const after = await fetchOnceServed(peer, '/get?name=hang');
+      assert.strictEqual(after.body.nodeId, peer.nodeId);
+      assert.strictEqual(after.body.count, 1);
+      assert.strictEqual(after.body.buffered, 1);
+    });
+  }
+);
+
 test('cluster: concurrent first requests to a DO read its owner record once per node', async () => {
   await withCluster(2, async ({ nodes, bucket }) => {
     // Without coalescing, each of these reads own.json and the losers retry

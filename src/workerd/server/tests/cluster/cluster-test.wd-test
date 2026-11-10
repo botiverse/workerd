@@ -49,5 +49,7 @@ const config :Workerd.Config = (
     ],
     address = "127.0.0.1:0",
     key = "test-cluster-shared-secret-of-32-bytes",
+    # Shorter than the default, so that a drain cut off at it is quick to test.
+    drainTimeoutMs = 3000,
   ),
 );
