@@ -388,6 +388,13 @@ impl Cluster {
         }
     }
 
+    /// Stops claiming before the claim reaches the bucket, but keeps the
+    /// lease: the objects this node owns stay its own, their commits still
+    /// acknowledged, while they flush before `start_draining`.
+    pub fn stop_claiming(&self) {
+        self.ownership.may_claim.set(false);
+    }
+
     /// Stops claiming before the claim reaches the bucket, and parks the
     /// lease loop; then `deregister`.
     pub fn start_draining(&self) {
@@ -450,11 +457,58 @@ async fn check_conditional_writes(bucket: &Bucket, node: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use cluster_logic::lease;
     use futures::executor::block_on;
 
+    use super::Cluster;
+    use super::Route;
+    use super::Setup;
     use super::check_conditional_writes;
+    use super::now_ms;
     use crate::Bucket;
     use crate::bucket::memory::Memory;
+
+    fn node(bucket: &Bucket, name: &str) -> Rc<Cluster> {
+        let setup = Setup {
+            url: String::new(),
+            options: Vec::new(),
+            node: name.to_owned(),
+            address: format!("{name}:1"),
+            ttl_ms: lease::LEASE_MS,
+            key: Vec::new(),
+        };
+        Cluster::over(bucket.clone(), setup)
+    }
+
+    #[test]
+    fn a_node_that_stopped_claiming_keeps_its_objects_and_its_lease() {
+        block_on(async {
+            let bucket = Bucket::memory("");
+            let (a, b) = (node(&bucket, "a"), node(&bucket, "b"));
+            a.join().await.unwrap();
+            b.join().await.unwrap();
+            let kept = a.acquire_or_route("ns", "kept", now_ms()).await.unwrap();
+            assert!(matches!(kept, Route::Owned(_)));
+
+            a.stop_claiming();
+            // Nothing new, nor anything it would have to take over...
+            assert!(a.acquire_or_route("ns", "new", now_ms()).await.is_err());
+            // ...but the lease loop is not parked, and the lease still renews,
+            assert!(!a.lease.borrow().draining);
+            a.renew(now_ms()).await.unwrap();
+            assert!(a.lease_holds());
+            // so a peer routes to what it owns rather than claiming it.
+            match b.acquire_or_route("ns", "kept", now_ms()).await.unwrap() {
+                Route::Remote { node, .. } => assert_eq!(node, "a"),
+                Route::Owned(_) => panic!("a peer claimed an object of a live node"),
+            }
+
+            a.start_draining();
+            assert!(a.lease.borrow().draining);
+        });
+    }
 
     #[test]
     fn a_bucket_that_ignores_preconditions_is_refused() {
