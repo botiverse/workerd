@@ -21,11 +21,19 @@
 //   9. Facets, their deletions and deleteAll() survive a takeover.
 
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { connect, createServer } from 'node:net';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { env } from 'node:process';
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -316,10 +324,27 @@ class FakeS3 {
 //   bucket     the FakeS3
 //   nodeKeys   Map from nodeId to the node's key (32-char hex), which is also
 //              what owner records name
-async function withCluster(numNodes, fn, { extraArgs = () => [] } = {}) {
+//
+// `config`, when given, edits the config's text: the edited config is written
+// next to a copy of the worker it embeds.
+async function withCluster(
+  numNodes,
+  fn,
+  { extraArgs = () => [], config = null } = {}
+) {
   // Each test run gets its own bucket and disks, so state doesn't leak
   // between tests.
   const root = await mkdtemp(join(tmpdir(), 'workerd-cluster-'));
+  let configPath = env.WD_TEST_CONFIG;
+  if (config !== null) {
+    configPath = join(root, 'cluster-test.wd-test');
+    const text = await readFile(env.WD_TEST_CONFIG, 'utf8');
+    await writeFile(configPath, config(text));
+    await copyFile(
+      join(dirname(env.WD_TEST_CONFIG), 'cluster-worker.js'),
+      join(root, 'cluster-worker.js')
+    );
+  }
   const bucket = new FakeS3();
   const nodes = [];
   const nodeKeys = new Map();
@@ -330,7 +355,7 @@ async function withCluster(numNodes, fn, { extraArgs = () => [] } = {}) {
       await mkdir(localPath);
       const node = new ClusterNode({
         binary: env.WORKERD_BINARY,
-        config: env.WD_TEST_CONFIG,
+        config: configPath,
         localPath,
         s3Port: bucket.port,
         nodeId: `node${i}`,
@@ -693,8 +718,11 @@ test(
       // Kept in memory only, until the owner drains.
       const exit = await owner.stop({ signal: 'SIGTERM', timeoutMs: 20_000 });
       assert.deepStrictEqual(exit, { code: 0, signal: null });
-      assert.match(owner.stderr, /cluster drain.*drained = 1/);
-      assert.match(owner.stderr, /cluster drain.*timed_out = 0/);
+      assert.match(
+        owner.stderr,
+        /cluster drain; service = "main"; namespace = "Counter"; drained = 1;/
+      );
+      assert.match(owner.stderr, /namespace = "Counter";.*; timed_out = 0;/);
 
       const after = await fetchOnceServed(peer, '/get?name=flush');
       assert.strictEqual(after.body.nodeId, peer.nodeId);
@@ -726,7 +754,7 @@ test(
         elapsed >= DRAIN_TIMEOUT_MS - 100 && elapsed < DRAIN_TIMEOUT_MS + 5000,
         `exited ${elapsed} ms after SIGTERM`
       );
-      assert.match(owner.stderr, /cluster drain.*timed_out = 1/);
+      assert.match(owner.stderr, /namespace = "Counter";.*; timed_out = 1;/);
 
       // What drain() wrote before it hung, committed long before the deadline
       // while the owner kept its lease, is the next owner's.
@@ -735,6 +763,123 @@ test(
       assert.strictEqual(after.body.count, 1);
       assert.strictEqual(after.body.buffered, 1);
     });
+  }
+);
+
+// SIGTERMs `owner`, which must exit cleanly; returns how long it took, in ms.
+async function drainOwner(owner) {
+  const signalled = Date.now();
+  const exit = await owner.stop({ signal: 'SIGTERM', timeoutMs: 20_000 });
+  assert.deepStrictEqual(exit, { code: 0, signal: null });
+  return Date.now() - signalled;
+}
+
+// Starts the DO `name` (of namespace `ns`, the Counter by default) on whichever
+// node claims it; returns that node and the other.
+async function ownerAndPeer(nodes, name, ns) {
+  const query = ns === undefined ? '' : `&ns=${ns}`;
+  const first = await fetchJson(
+    nodes[0].httpPort,
+    `/identity?name=${name}${query}`
+  );
+  assert.strictEqual(first.status, 200, JSON.stringify(first.body));
+  return [
+    nodes.find((n) => n.nodeId === first.body.nodeId),
+    nodes.find((n) => n.nodeId !== first.body.nodeId),
+  ];
+}
+
+test(
+  'cluster: a namespace that does not opt in is not drained',
+  SIGTERM_DRAINS,
+  async () => {
+    await withCluster(2, async ({ nodes }) => {
+      const [owner, peer] = await ownerAndPeer(nodes, 'unopted', 'unopted');
+      const buffered = await fetchJson(
+        owner.httpPort,
+        '/buffer?name=unopted&ns=unopted'
+      );
+      assert.strictEqual(buffered.body.buffered, 1);
+      await drainOwner(owner);
+      assert.doesNotMatch(owner.stderr, /namespace = "Unopted"/);
+
+      // drain() never ran: what it would have written is lost.
+      const after = await fetchOnceServed(peer, '/get?name=unopted&ns=unopted');
+      assert.strictEqual(after.body.nodeId, peer.nodeId);
+      assert.strictEqual(after.body.buffered, 0);
+    });
+  }
+);
+
+test(
+  'cluster: an opted-in DO whose class has no drain() is skipped',
+  SIGTERM_DRAINS,
+  async () => {
+    await withCluster(2, async ({ nodes }) => {
+      const [owner] = await ownerAndPeer(nodes, 'plain', 'no-drain');
+      const elapsed = await drainOwner(owner);
+      const line = owner.stderr.match(
+        /namespace = "NoDrain"; drained = 0; skipped = 1; failed = 0; timed_out = 0; ms = (\d+)/
+      );
+      assert(line !== null, 'no drain line for NoDrain');
+      assert(Number(line[1]) < 1000, `skipping took ${line[1]} ms`);
+      assert(elapsed < DRAIN_TIMEOUT_MS, `exited ${elapsed} ms after SIGTERM`);
+    });
+  }
+);
+
+test(
+  'cluster: a drain() that throws fails alone, and the node still exits',
+  SIGTERM_DRAINS,
+  async () => {
+    await withCluster(2, async ({ nodes }) => {
+      const [owner, peer] = await ownerAndPeer(nodes, 'throws');
+      await fetchJson(owner.httpPort, '/buffer?name=throws');
+      await fetchJson(owner.httpPort, '/throw-drain?name=throws');
+      await drainOwner(owner);
+      assert.match(
+        owner.stderr,
+        /namespace = "Counter"; drained = 0; skipped = 0; failed = 1; timed_out = 0;/
+      );
+
+      // It wrote before it threw.
+      const after = await fetchOnceServed(peer, '/get?name=throws');
+      assert.strictEqual(after.body.nodeId, peer.nodeId);
+      assert.strictEqual(after.body.buffered, 1);
+    });
+  }
+);
+
+test(
+  'cluster: drainTimeoutMs = 0 calls no drain()',
+  SIGTERM_DRAINS,
+  async () => {
+    const config = (text) => {
+      const edited = text.replace(
+        'drainTimeoutMs = 3000',
+        'drainTimeoutMs = 0'
+      );
+      assert.notStrictEqual(edited, text);
+      return edited;
+    };
+    await withCluster(
+      2,
+      async ({ nodes }) => {
+        const [owner, peer] = await ownerAndPeer(nodes, 'off');
+        await fetchJson(owner.httpPort, '/buffer?name=off');
+        await fetchJson(owner.httpPort, '/hang-drain?name=off');
+        const elapsed = await drainOwner(owner);
+        assert(
+          elapsed < DRAIN_TIMEOUT_MS,
+          `exited ${elapsed} ms after SIGTERM`
+        );
+        assert.doesNotMatch(owner.stderr, /cluster drain/);
+
+        const after = await fetchOnceServed(peer, '/get?name=off');
+        assert.strictEqual(after.body.buffered, 0);
+      },
+      { config }
+    );
   }
 );
 
