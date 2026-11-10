@@ -24,6 +24,8 @@ use workerd_capnp::service;
 use workerd_capnp::socket;
 
 use crate::Result;
+use crate::actor::ActorNamespace;
+use crate::actor::Drained;
 use crate::bench;
 use crate::bindings::Designator;
 use crate::bindings::len_u32;
@@ -406,18 +408,43 @@ pub async fn run(
     // Draining stops the accept loops; the listeners then end once their connections have.
     match futures::future::select(serving, drain).await {
         Either::Left((result, _)) => result?,
-        Either::Right(((), serving)) => {
-            // A draining instance claims nothing more, lets its clustered objects go,
-            // `preventEviction` or not, and leaves the cluster, so peers take them over at their
-            // next listing while its connections finish. A request in flight on one could not
-            // commit anyway once a peer owns the object.
+        Either::Right(((), mut serving)) => {
+            // A draining instance claims nothing more. It keeps its lease while its running
+            // clustered objects' `drain()` methods flush them, so their commits are still
+            // acknowledged and no peer takes them over meanwhile. Then it lets its clustered
+            // objects go, `preventEviction` or not, and leaves the cluster, so peers take them
+            // over at their next listing while its connections finish. A request in flight on
+            // one could not commit anyway once a peer owns the object.
+            let mut served = false;
             if let Some(node) = server.cluster() {
-                node.cluster.start_draining();
+                node.cluster.stop_claiming();
                 let workers = server
                     .services()
                     .filter_map(|(_, service)| service.as_worker());
-                let namespaces = workers.flat_map(|worker| worker.namespaces());
-                for (_, namespace) in namespaces.filter(|(_, ns)| ns.cluster().is_some()) {
+                let namespaces: Vec<_> = workers
+                    .flat_map(|worker| worker.namespaces())
+                    .filter(|(_, ns)| ns.cluster().is_some())
+                    .collect();
+                if !node.drain_timeout.is_zero() {
+                    // The listeners serve on meanwhile: their connections are driven by
+                    // `serving`. Only a listener's failure ends it before the drain signal.
+                    let flush = std::pin::pin!(drain_actors(&namespaces, node.drain_timeout));
+                    if let Either::Right((result, flush)) =
+                        futures::future::select(flush, serving.as_mut()).await
+                    {
+                        result?;
+                        served = true;
+                        flush.await;
+                    }
+                }
+                // TODO(cluster): release each drained object's owner record (node "") so that
+                // peers claim it at once, not once their listing drops this node (up to 3 s).
+                // Not at the end of its drain: the actor still serves reads here until
+                // `abort_all`, which a peer's new epoch would make stale. And even after it, the
+                // eviction its abort starts (`Owners::evict`) still tiers the object's log into
+                // the bucket while the peer recovers from it, a race nothing yet shows is safe.
+                node.cluster.start_draining();
+                for (_, namespace) in &namespaces {
                     namespace.abort_all(None);
                 }
                 if let Err(e) = node.cluster.deregister().await {
@@ -425,7 +452,9 @@ pub async fn run(
                 }
             }
             draining.send_replace(true);
-            serving.await?;
+            if !served {
+                serving.await?;
+            }
         }
     }
 
@@ -438,6 +467,44 @@ pub async fn run(
         namespace.begin_container_cleanup();
     }
     Ok(ffi::factory_shutdown_containers(server.factory().raw()).await?)
+}
+
+/// Runs the `drain()` methods of the running actors of `namespaces`, every namespace's at once,
+/// for at most `timeout`, and logs what became of each namespace's: drained, without a `drain()`,
+/// failed, cut off at the deadline, and how long it took.
+async fn drain_actors(namespaces: &[(String, Rc<ActorNamespace>)], timeout: Duration) {
+    let drains = namespaces.iter().map(|(class, namespace)| async move {
+        let started = std::time::Instant::now();
+        let Drained {
+            drained,
+            skipped,
+            failed,
+            timed_out,
+        } = namespace.drain_all(timeout).await;
+        let ms = started.elapsed().as_millis();
+        if failed + timed_out > 0 {
+            tracing::warn!(
+                namespace = class.as_str(),
+                drained,
+                skipped,
+                failed,
+                timed_out,
+                ms,
+                "cluster drain"
+            );
+        } else {
+            tracing::info!(
+                namespace = class.as_str(),
+                drained,
+                skipped,
+                failed,
+                timed_out,
+                ms,
+                "cluster drain"
+            );
+        }
+    });
+    futures::future::join_all(drains).await;
 }
 
 /// The entrypoints `workerd test` or `workerd bench` runs a handler of: the channel of each,

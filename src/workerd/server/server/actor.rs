@@ -109,6 +109,19 @@ pub struct ActorNamespace {
     resolving: RefCell<HashMap<String, Rc<Notify>>>,
 }
 
+/// What `drain_all` did with a namespace's running actors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    /// Their `drain()` completed, and what it wrote is durable.
+    pub drained: usize,
+    /// Their class has no `drain()`.
+    pub skipped: usize,
+    /// Their `drain()` threw, or the request it runs in failed.
+    pub failed: usize,
+    /// Cut off at the deadline.
+    pub timed_out: usize,
+}
+
 /// The first resolution of an actor: its end, however it ends, wakes the requests that waited.
 struct Resolving<'a> {
     pending: &'a RefCell<HashMap<String, Rc<Notify>>>,
@@ -371,6 +384,42 @@ impl ActorNamespace {
         for container in actors.values() {
             container.abort(reason.cloned());
         }
+    }
+
+    /// Runs the `drain()` method of every running root actor whose class has one, all at once,
+    /// cutting off those not done `timeout` from now. The actors keep serving meanwhile, and stay
+    /// once drained: the caller lets them go (`abort_all`).
+    pub async fn drain_all(&self, timeout: Duration) -> Drained {
+        // Collected, so that the map is not borrowed while the actors run: one that breaks
+        // leaves it.
+        let drains: Vec<_> = self
+            .actors
+            .borrow()
+            .values()
+            .filter(|container| container.is_running() && container.require_not_broken().is_ok())
+            .map(|container| {
+                let (container, factory) = (Rc::clone(container), Rc::clone(&self.factory));
+                async move {
+                    let drain = std::pin::pin!(container.drain());
+                    let deadline = std::pin::pin!(factory.sleep(timeout));
+                    match futures::future::select(drain, deadline).await {
+                        Either::Left((result, _)) => Some(result),
+                        // Dropping the drain cancels the method's request.
+                        Either::Right(_) => None,
+                    }
+                }
+            })
+            .collect();
+        let mut drained = Drained::default();
+        for result in futures::future::join_all(drains).await {
+            match result {
+                Some(Ok(true)) => drained.drained += 1,
+                Some(Ok(false)) => drained.skipped += 1,
+                Some(Err(_)) => drained.failed += 1,
+                None => drained.timed_out += 1,
+            }
+        }
+        drained
     }
 
     /// Aborts every actor and deletes the namespace's storage and alarms.
@@ -1000,6 +1049,13 @@ impl ActorContainer {
         *self.on_broken_task.borrow_mut() = monitor;
         *self.actor.borrow_mut() = Some(actor);
         Ok(())
+    }
+
+    /// Runs the actor's `drain()` method as a request of its own: whether its class has one. It
+    /// completes once what the method wrote is durable.
+    async fn drain(self: &Rc<Self>) -> Result<bool> {
+        let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
+        Ok(ffi::worker_drain(self.start_request(metadata)?).await?)
     }
 
     /// Starts a request on the actor, starting the actor first if it is not running. The request

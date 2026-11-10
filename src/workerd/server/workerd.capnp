@@ -156,6 +156,15 @@ struct ClusterConfig {
   # Allow a public IP as `address` or `advertise`. Refused by default, since traffic between
   # instances is not encrypted. Private, loopback, link-local and shared (100.64.0.0/10, as
   # Tailscale uses) addresses, wildcards and hostnames are allowed.
+
+  drainTimeoutMs @6 :UInt32 = 6000;
+  # How long a draining instance (SIGTERM) gives its running Durable Objects to flush before it
+  # lets them go. It first stops claiming objects, keeping its lease, so the objects it owns stay
+  # its own and their writes are still acknowledged; then calls the `drain()` method of each
+  # running Durable Object whose class defines one, all at once, and waits for them, and for what
+  # they wrote to be durable, for at most this long. Then it lets its objects go and leaves the
+  # cluster, as it does without a `drain()`. 0 skips the `drain()` calls. Keep it well within the
+  # time the instance has to exit after SIGTERM, and under the lease (20 s).
 }
 
 struct LoggingOptions {

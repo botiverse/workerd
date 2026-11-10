@@ -217,6 +217,7 @@ kj::Own<WorkerInterface> worker_interface_attach(
     kj::Own<WorkerInterface> inner, ::rust::Box<KeepAlive> keep);
 kj::Promise<::rust::Vec<uint64_t>> worker_bench(
     kj::Own<WorkerInterface> worker, ::rust::Slice<const uint64_t> params);
+kj::Promise<bool> worker_drain(kj::Own<WorkerInterface> worker);
 kj::Own<ActorHandle> worker_new_actor(const CompiledWorker& worker,
     ::rust::Str className,
     kj::Maybe<kj::Own<Frankenvalue>> props,

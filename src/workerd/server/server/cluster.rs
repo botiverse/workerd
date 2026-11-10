@@ -68,6 +68,8 @@ pub struct ClusterNode {
     nonces: RefCell<HashMap<String, u64>>,
     /// The clustered namespaces, by their part of the bucket's keys.
     namespaces: RefCell<HashMap<String, Weak<ActorNamespace>>>,
+    /// How long a drain waits for the actors' `drain()` methods (`drainTimeoutMs`).
+    pub drain_timeout: Duration,
 }
 
 /// How often an instance tidies its alarm index and adopts dead peers' alarms.
@@ -216,6 +218,7 @@ impl ClusterNode {
             advertise: address,
             nonces: RefCell::default(),
             namespaces: RefCell::default(),
+            drain_timeout: Duration::from_millis(conf.get_drain_timeout_ms().into()),
         }))
     }
 

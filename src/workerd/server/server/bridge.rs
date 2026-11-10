@@ -393,6 +393,10 @@ pub mod ffi {
         /// handler filled in, encoded, without its name. The failures of the handler's code are
         /// in the group; an error means the handler could not be run at all.
         async fn worker_bench(worker: KjOwn<WorkerInterface>, params: &[u64]) -> Result<Vec<u64>>;
+        /// Runs the `drain()` method of the actor the request `worker` is on, if its class has
+        /// one, then waits for what it wrote to be durable. Returns whether it had one; an error
+        /// is the method's failure, which the actor's own logs report.
+        async fn worker_drain(worker: KjOwn<WorkerInterface>) -> Result<bool>;
         /// Constructs an actor of `class_name` whose storage lives in `storage`. `hooks` is the
         /// actor's way back to the server; `hibernation_manager` is the evicted predecessor's,
         /// whose WebSockets the actor adopts. `container` gives the actor its container's Docker
