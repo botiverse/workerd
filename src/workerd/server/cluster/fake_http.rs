@@ -3,7 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 //! An HTTP/1.1 server on a loopback port for tests, hyper's, that answers
-//! each request as the test says and keeps what it received.
+//! each request as the test says and keeps what it received; and one that
+//! closes a connection the client reused (`closing`).
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -19,6 +20,9 @@ use bytes::Bytes;
 use http_body::Body as _;
 use http_body::Frame;
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 /// A request as the server received it.
@@ -255,4 +259,69 @@ impl http_body::Body for Body {
                 .map(|_| Some(Ok(Frame::data(Bytes::from_static(b" "))))),
         }
     }
+}
+
+/// The request lines a `closing` server received, each with the number of
+/// the connection it came on, from 0.
+pub type Lines = Arc<Mutex<Vec<(usize, String)>>>;
+
+/// A server whose first connection answers `answered` requests and then
+/// closes after reading the next one's head, as a bucket does when it has
+/// closed an idle keep-alive connection that the client has just reused.
+/// The request's body, if any, is left unread, so the close may be a reset.
+/// Later connections answer every request with `then`; the first
+/// connection's answers are 200s. Each answer has an `etag`. Answers
+/// `127.0.0.1:<port>`.
+pub async fn closing(answered: usize, then: u16) -> (String, Lines) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    let received = Lines::default();
+    let log = received.clone();
+    tokio::spawn(async move {
+        for index in 0.. {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut count = 0;
+                while let Some(head) = read_head(&mut stream).await {
+                    let line = head.lines().next().unwrap_or_default().to_owned();
+                    log.lock().unwrap().push((index, line));
+                    if index == 0 && count == answered {
+                        return;
+                    }
+                    count += 1;
+                    let mut body = vec![0; content_length(&head)];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let status = if index == 0 { 200 } else { then };
+                    let answer =
+                        format!("HTTP/1.1 {status} X\r\netag: \"e\"\r\ncontent-length: 0\r\n\r\n");
+                    stream.write_all(answer.as_bytes()).await.unwrap();
+                }
+            });
+        }
+    });
+    (host, received)
+}
+
+/// The head of the next request on `io`, or `None` once the client has
+/// closed it.
+async fn read_head(io: &mut (impl AsyncRead + Unpin)) -> Option<String> {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        if io.read(&mut byte).await.ok()? == 0 {
+            return None;
+        }
+        head.push(byte[0]);
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+fn content_length(head: &str) -> usize {
+    let length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())?
+    });
+    length.unwrap_or(0)
 }

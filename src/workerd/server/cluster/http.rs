@@ -5,6 +5,7 @@
 //! The bucket's HTTP client: hyper's pooled HTTP/1.1 client over TCP, with
 //! rustls and the platform's roots for `https` endpoints.
 
+use std::error::Error;
 use std::future::Future;
 use std::future::poll_fn;
 use std::io;
@@ -14,6 +15,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -26,6 +29,7 @@ use hyper_util::client::legacy::connect::Connected;
 use hyper_util::client::legacy::connect::Connection;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use hyper_util::rt::TokioTimer;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::ConfigVerifierExt;
@@ -67,6 +71,34 @@ pub const MAX_BODY: usize = 16 << 20;
 /// Error text for a response body larger than [`MAX_BODY`].
 pub const TOO_LARGE: &str = "response body too large";
 
+/// How long an idle connection stays in the pool. S3 closes a keep-alive
+/// connection idle for about 20 s, and hyper may not have read the close
+/// when it hands the connection to the next request, which then fails once
+/// written (`SendError::closed_while_idle`). hyper-util's default is 90 s.
+const POOL_IDLE: Duration = Duration::from_secs(15);
+
+/// Why `Http::send` failed.
+#[derive(Debug)]
+pub struct SendError {
+    /// The error and each of its causes, separated by colons.
+    pub text: String,
+    /// The request went out on a pooled connection that its peer had closed
+    /// while it was idle: one that had served a response, and then closed or
+    /// reset without answering this one. hyper sends again only a request
+    /// it had not yet written. A failure on a connection's first request is
+    /// not this: there it is the peer's answer.
+    pub closed_while_idle: bool,
+}
+
+impl From<String> for SendError {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            closed_while_idle: false,
+        }
+    }
+}
+
 /// Clones share the connection pool.
 #[derive(Clone)]
 pub struct Http {
@@ -76,7 +108,13 @@ pub struct Http {
 impl Http {
     pub fn new() -> Result<Self, rustls::Error> {
         let tls = Arc::new(ClientConfig::with_platform_verifier()?);
-        let client = legacy::Client::builder(TokioExecutor::new()).build(Connector(tls));
+        let client = legacy::Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(POOL_IDLE)
+            // Without a timer, idle connections are evicted only when their
+            // host is next asked for; with one, the pool closes them itself,
+            // before the bucket does.
+            .pool_timer(TokioTimer::new())
+            .build(Connector(tls));
         Ok(Self { client })
     }
 
@@ -92,7 +130,7 @@ impl Http {
         payload: Payload,
         to: Option<&Path>,
         (head, idle): (Duration, Duration),
-    ) -> Result<HttpResponse, String> {
+    ) -> Result<HttpResponse, SendError> {
         let mut request = http::Request::builder().method(method.as_str()).uri(url);
         for pair in headers.chunks(2) {
             request = request.header(&pair[0], &pair[1]);
@@ -105,7 +143,13 @@ impl Http {
         let response = tokio::time::timeout(head, self.client.request(request))
             .await
             .map_err(|_| "timed out".to_owned())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SendError {
+                text: causes(&e),
+                closed_while_idle: closed_while_idle(&e),
+            })?;
+        if let Some(served) = response.extensions().get::<Served>() {
+            served.mark();
+        }
         let header = |name| {
             let value = response.headers().get(name);
             value.and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
@@ -135,13 +179,13 @@ impl Http {
                 .map_err(|_| "timed out reading the body".to_owned())?;
             let Some(frame) = frame else { break };
             let chunk = frame
-                .map_err(|e| e.to_string())?
+                .map_err(|e| causes(&e))?
                 .into_data()
                 .unwrap_or_default();
             if writer.is_none() {
                 // Records, listings, deployments and errors: an endpoint sending more is broken.
                 if body.len() + chunk.len() > MAX_BODY {
-                    return Err(TOO_LARGE.to_owned());
+                    return Err(TOO_LARGE.to_owned().into());
                 }
                 body.extend(chunk);
             } else if tx.send(chunk).await.is_err() {
@@ -164,6 +208,49 @@ impl Http {
             body,
         })
     }
+}
+
+/// `error` and each of its sources, separated by colons: hyper's own text
+/// for a failed request is only `client error (SendRequest)`.
+fn causes(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        message.push_str(": ");
+        message.push_str(&e.to_string());
+        source = e.source();
+    }
+    message
+}
+
+/// Whether `error` is `SendError::closed_while_idle`'s.
+fn closed_while_idle(error: &legacy::Error) -> bool {
+    let mut extras = http::Extensions::new();
+    if let Some(connected) = error.connect_info() {
+        connected.get_extras(&mut extras);
+    }
+    if !extras.get::<Served>().is_some_and(Served::get) {
+        return false;
+    }
+    let mut source = error.source();
+    while let Some(e) = source {
+        if e.downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return true;
+        }
+        if let Some(io) = e.downcast_ref::<io::Error>() {
+            return matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = e.source();
+    }
+    false
 }
 
 tokio::task_local! {
@@ -386,24 +473,54 @@ impl tower_service::Service<Uri> for Connector {
             let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
             let tcp = TcpStream::connect((host.as_str(), port)).await?;
             tcp.set_nodelay(true)?;
-            if !https {
-                return Ok(TokioIo::new(Stream::Tcp(tcp)));
-            }
-            let name = ServerName::try_from(host).map_err(|_| invalid())?;
-            let tls = TlsConnector::from(tls).connect(name, tcp).await?;
-            Ok(TokioIo::new(Stream::Tls(Box::new(tls))))
+            let io = if https {
+                let name = ServerName::try_from(host).map_err(|_| invalid())?;
+                let tls = TlsConnector::from(tls).connect(name, tcp).await?;
+                Transport::Tls(Box::new(tls))
+            } else {
+                Transport::Tcp(tcp)
+            };
+            Ok(TokioIo::new(Stream {
+                io,
+                served: Served::default(),
+            }))
         })
     }
 }
 
-enum Stream {
+/// A connection to the bucket, and whether it has served a response.
+struct Stream {
+    io: Transport,
+    served: Served,
+}
+
+enum Transport {
     Tcp(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+/// Set once a connection has delivered a response head. A request that
+/// fails on a connection with this set went out on one that waited in the
+/// pool, which its peer may have closed in the meantime.
+#[derive(Clone, Default)]
+struct Served(Arc<AtomicBool>);
+
+impl Served {
+    fn mark(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 impl Connection for Stream {
     fn connected(&self) -> Connected {
-        Connected::new()
+        // hyper-util puts the extra in the extensions of every response the
+        // connection carries, and in the error of a request that failed on
+        // it.
+        Connected::new().extra(self.served.clone())
     }
 }
 
@@ -413,9 +530,9 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        match &mut self.get_mut().io {
+            Transport::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Transport::Tls(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -426,23 +543,23 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        match &mut self.get_mut().io {
+            Transport::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Transport::Tls(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
-            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+        match &mut self.get_mut().io {
+            Transport::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Transport::Tls(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        match &mut self.get_mut().io {
+            Transport::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Transport::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

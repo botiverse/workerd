@@ -28,6 +28,7 @@ use crate::http::Call;
 use crate::http::Http;
 use crate::http::HttpResponse;
 use crate::http::Payload;
+use crate::http::SendError;
 
 /// What a bucket API's dialect decides about a request.
 pub trait Dialect {
@@ -221,7 +222,12 @@ impl<D: Dialect> Client<D> {
     /// the dialect has another credential for it. Each authorized request is
     /// sent once more if `http::prompt` bounds it and it has not answered in
     /// time (`http::attempt`), both copies with one authorization, their
-    /// answers judged by `settles`.
+    /// answers judged by `settles`. A request that went out on a pooled
+    /// connection the bucket had closed while it was idle
+    /// (`SendError::closed_while_idle`) is sent again at once, up to
+    /// `STALE_RESENDS` times: under a burst of commits at the top of a
+    /// minute, log writes failed `client error (SendRequest)` that way, each
+    /// breaking its object.
     ///
     /// An attempt sent again may have been applied, and a conditional
     /// write's next attempt then fails its guard against it
@@ -262,6 +268,7 @@ impl<D: Dialect> Client<D> {
         let mut pause = Duration::from_millis(250);
         let mut reauthorized = false;
         let mut maybe_applied = false;
+        let mut stale = 0;
         loop {
             let mut request = Request {
                 method,
@@ -273,12 +280,28 @@ impl<D: Dialect> Client<D> {
             let credential = self.dialect.authorize(&mut request).await?;
             let once = || {
                 let headers = request.headers.clone();
-                self.send_once(method, key, &url, headers, body.clone(), to)
+                self.send_once(method, &url, headers, body.clone(), to)
             };
             let settled = |response: &HttpResponse| settles(guarded, response);
             let attempt = crate::http::attempt(call, what, settled, once).await;
             maybe_applied |= attempt.sent_twice;
-            let response = attempt.answer?;
+            let response = match attempt.answer {
+                Ok(response) => response,
+                // Sent again with a fresh authorization and body: a file is
+                // read again from the start.
+                Err(error) if error.closed_while_idle && stale < STALE_RESENDS => {
+                    tracing::warn!(
+                        "cluster: {} went out on a connection the bucket had closed ({}); \
+                         sending it again",
+                        what(),
+                        error.text
+                    );
+                    stale += 1;
+                    maybe_applied = true;
+                    continue;
+                }
+                Err(error) => return Err(request_error(method, key, &error.text)),
+            };
             // A refused credential is dropped even when the request is not
             // sent again, so that no later request carries it.
             if response.status == 401
@@ -303,12 +326,11 @@ impl<D: Dialect> Client<D> {
     async fn send_once(
         &self,
         method: &str,
-        key: &str,
         url: &str,
         headers: Vec<(String, String)>,
         body: Payload,
         to: Option<&Path>,
-    ) -> Result<HttpResponse> {
+    ) -> std::result::Result<HttpResponse, SendError> {
         let headers = headers.into_iter().flat_map(<[String; 2]>::from).collect();
         // A hung request would stall whatever waits on it: a tiering pass
         // waits for every object, so one could stop a node's tiering. A
@@ -329,8 +351,7 @@ impl<D: Dialect> Client<D> {
                 to,
                 (head, REQUEST_TIMEOUT),
             )
-            .await
-            .map_err(|error| request_error(method, key, &error))?;
+            .await?;
         if let Some(skew) = skew_ms(sent, SystemTime::now(), &response.date) {
             self.skew_ms.set(Some(skew));
         }
@@ -352,7 +373,9 @@ struct Sent {
     /// So may a copy `http::attempt` sent beside the one answered
     /// (`http::Attempt::sent_twice`), before that one's guard was checked or
     /// after: its own answer is dropped when the other's comes first, a 401
-    /// among them.
+    /// among them. So may one whose connection closed or reset under it
+    /// (`SendError::closed_while_idle`): a reset need not come before the
+    /// bucket read the request.
     maybe_applied: bool,
 }
 
@@ -391,6 +414,14 @@ const fn settles(guarded: bool, response: &HttpResponse) -> bool {
         _ => true,
     }
 }
+
+/// How many times a request that went out on a pooled connection the bucket
+/// had closed is sent again. A failed connection leaves the pool, so each
+/// resend goes out on another pooled connection, which may be stale too, or
+/// on a new one, whose failure is not taken for a stale connection's.
+/// Pooled connections expire before the bucket closes them
+/// (`http::POOL_IDLE`), so more than one stale in a row is rare.
+const STALE_RESENDS: u32 = 2;
 
 /// How long one bucket request may take. R2 answers in 0.1-1 s from the
 /// lab, with spikes of a few seconds.
