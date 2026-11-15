@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -324,6 +325,79 @@ fn an_s3_bucket_end_to_end() {
         let wire = (("etag", "\"e\""), "x-amz-meta-", true);
         retried(&bucket, &server, &queue, wire.0).await;
         end_to_end::<SigV4>(bucket, &server, &queue, wire).await;
+    });
+}
+
+/// An S3 client of the bucket `b` at `host`.
+fn s3(host: &str) -> Bucket {
+    let options = [
+        ("aws_endpoint", format!("http://{host}")),
+        ("aws_region", "auto".into()),
+        ("aws_access_key_id", "k".into()),
+        ("aws_secret_access_key", "s".into()),
+    ]
+    .map(|(name, value)| (name.to_owned(), value));
+    let (s3, prefix) = S3::new("s3://b", &options).unwrap();
+    Bucket::new(s3, &prefix)
+}
+
+/// The numbers of the connections a `closing` server's requests came on.
+fn connections(received: &crate::fake_http::Lines) -> Vec<usize> {
+    received.lock().unwrap().iter().map(|(n, _)| *n).collect()
+}
+
+#[test]
+fn a_write_on_a_connection_the_bucket_closed_while_idle_is_sent_again() {
+    runtime().block_on(async {
+        // As a log write: a file, read again for the request sent again.
+        let tmp = std::env::var_os("TEST_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let file = tmp.join(format!("closed-while-idle-{}", std::process::id()));
+        std::fs::write(&file, "frames").unwrap();
+        let (host, received) = crate::fake_http::closing(1, 200).await;
+        let bucket = s3(&host);
+        bucket.put_file("k", &file, &[]).await.unwrap();
+        // The bucket closes the pooled connection under the second write,
+        // which goes again on a new one.
+        bucket.put_file("k", &file, &[]).await.unwrap();
+        assert_eq!(connections(&received), [0, 0, 1]);
+        let lines = received.lock().unwrap().clone();
+        assert!(
+            lines.iter().all(|(_, line)| line == "PUT /b/k HTTP/1.1"),
+            "{lines:?}"
+        );
+        std::fs::remove_file(&file).unwrap();
+    });
+}
+
+#[test]
+fn a_guarded_write_sent_again_on_a_closed_connection_keeps_its_unknown_outcome() {
+    runtime().block_on(async {
+        // The write whose connection closed may have landed: a failed guard
+        // to the one sent again may be against it.
+        for (then, expected) in [
+            (200, Ok(format!("Some({:?})", "\"e\""))),
+            (412, Err("unknown: PUT k: 412 to a retry".to_owned())),
+        ] {
+            let (host, received) = crate::fake_http::closing(1, then).await;
+            let bucket = s3(&host);
+            bucket.put("k", Vec::new(), &[]).await.unwrap();
+            assert_eq!(call(&bucket, Call::PutIfAbsent).await, expected);
+            assert_eq!(connections(&received), [0, 0, 1]);
+        }
+    });
+}
+
+#[test]
+fn a_write_whose_new_connection_closes_is_not_sent_again() {
+    runtime().block_on(async {
+        let (host, received) = crate::fake_http::closing(0, 200).await;
+        let outcome = call(&s3(&host), Call::Put).await;
+        let error = outcome.unwrap_err();
+        assert!(
+            error.starts_with("PUT k: client error (SendRequest): "),
+            "{error}"
+        );
+        assert_eq!(connections(&received), [0]);
     });
 }
 

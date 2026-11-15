@@ -33,7 +33,53 @@ fn a_body_held_in_memory_is_capped() {
         let url = format!("http://127.0.0.1:{port}/");
         let payload = Payload::Bytes(bytes::Bytes::new());
         let sent = http.send("GET".into(), url, vec![], payload, None, (wait, wait));
-        assert_eq!(sent.await.err().as_deref(), Some("response body too large"));
+        let text = sent.await.err().map(|e| e.text);
+        assert_eq!(text.as_deref(), Some("response body too large"));
+    });
+}
+
+/// A PUT of `x` to `/b/k` on `host`.
+fn put(http: &Http, host: &str) -> impl Future<Output = Result<HttpResponse, SendError>> {
+    let wait = Duration::from_secs(30);
+    let url = format!("http://{host}/b/k");
+    let payload = Payload::Bytes(bytes::Bytes::from_static(b"x"));
+    http.send("PUT".into(), url, vec![], payload, None, (wait, wait))
+}
+
+#[test]
+fn a_request_on_a_connection_closed_while_idle_fails_as_such() {
+    runtime().block_on(async {
+        // The second request goes out on the first's pooled connection,
+        // which the server closes under it. hyper does not send it again,
+        // and its own text names no cause: the bucket's commits failed with
+        // only `client error (SendRequest)`.
+        let (host, received) = crate::fake_http::closing(1, 200).await;
+        let http = Http::new().unwrap();
+        put(&http, &host).await.unwrap();
+        let Err(error) = put(&http, &host).await else {
+            panic!("answered");
+        };
+        assert!(error.closed_while_idle, "{error:?}");
+        assert!(
+            error.text.starts_with("client error (SendRequest): "),
+            "{error:?}"
+        );
+        let put_line = "PUT /b/k HTTP/1.1".to_owned();
+        assert_eq!(
+            *received.lock().unwrap(),
+            [(0, put_line.clone()), (0, put_line)]
+        );
+
+        // On a new connection, the same close is the server's answer.
+        let (host, _) = crate::fake_http::closing(0, 200).await;
+        let Err(error) = put(&http, &host).await else {
+            panic!("answered");
+        };
+        assert!(!error.closed_while_idle, "{error:?}");
+        assert!(
+            error.text.starts_with("client error (SendRequest): "),
+            "{error:?}"
+        );
     });
 }
 
@@ -50,7 +96,7 @@ async fn serving(answer: impl Fn(usize) -> Answer + Send + Sync + 'static) -> Se
     Server::serving(move |_, n| answer(n)).await
 }
 
-fn get(http: &Http, server: &Server) -> impl Future<Output = Result<HttpResponse, String>> {
+fn get(http: &Http, server: &Server) -> impl Future<Output = Result<HttpResponse, SendError>> {
     let wait = Duration::from_secs(30);
     let url = format!("http://{}/k", server.host);
     let payload = Payload::Bytes(bytes::Bytes::new());
