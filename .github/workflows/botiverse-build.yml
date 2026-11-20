@@ -54,3 +54,13 @@ jobs:
           name: workerd-linux-x64-${{ github.sha }}
           path: bazel-bin/src/workerd/server/workerd
           retention-days: 30
+      # After the upload, so that a failing test still leaves the binary to look at. Same config as the
+      # build, so the workerd these tests run is the one built above.
+      - name: Test the cluster (crate, peer sessions, cluster suite)
+        run: >-
+          env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_NDK_LATEST_HOME
+          bazel test --config=release --disk_cache=~/bazel-disk-cache --jobs=4 --test_output=errors
+          //src/workerd/server/cluster:cluster_test
+          //src/workerd/server/factory:worker-factory-rpc-test@
+          //src/workerd/server/tests/cluster:cluster-test
+          //src/workerd/server/tests/cluster:cluster-cron-test
