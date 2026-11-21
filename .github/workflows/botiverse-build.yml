@@ -20,6 +20,9 @@ concurrency:
 jobs:
   linux-x64:
     runs-on: ubuntu-24.04
+    # To publish the binary as a release asset, which the platform release downloads by URL and sha256.
+    permissions:
+      contents: write
     # GitHub-hosted jobs stop at 6 hours.
     timeout-minutes: 355
     steps:
@@ -54,6 +57,14 @@ jobs:
           name: workerd-linux-x64-${{ github.sha }}
           path: bazel-bin/src/workerd/server/workerd
           retention-days: 30
+      # The same binary as a prerelease asset named `workerd`, at a public URL that needs no token.
+      - name: Publish the binary as a prerelease asset
+        run: >-
+          gh release create "build-$GITHUB_SHA" "bazel-bin/src/workerd/server/workerd#workerd"
+          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease
+          --title "workerd linux-x64 $GITHUB_SHA" --notes "branch $GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
       # After the upload, so that a failing test still leaves the binary to look at. Same config as the
       # build, so the workerd these tests run is the one built above.
       - name: Test the cluster (crate, peer sessions, cluster suite)
