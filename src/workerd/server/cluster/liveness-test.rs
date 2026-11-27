@@ -580,3 +580,38 @@ fn the_grant_clock_counts_time_suspended() {
         "{elapsed}"
     );
 }
+
+#[test]
+fn with_both_a_stale_view_judges_no_held_record_dead_and_a_fresh_one_deletes_it() {
+    let (socket, fake) = provider(300);
+    run(async {
+        let bucket = Bucket::memory("");
+        let ttl = 1_000;
+        let agent = Rc::new(Agent::new(socket));
+        let registry = Registry::new(bucket.clone(), "a", "a:1", ttl).with_agent(agent, true);
+        let now = now_ms();
+        // An `external` peer, which its machine's lease no longer lists in
+        // a view too old to tell.
+        record(&bucket, "b", HELD_BY_MACHINE, Some("m2")).await;
+        fake.set(|s| s.age_ms = ttl);
+        registry.peers(now).await.unwrap();
+        assert!(registry.dead().is_empty());
+        // Fresh: dead. Its record stays while it is new, and while it has
+        // alarms; then it goes, as no reader without a provider could ever
+        // take it for dead.
+        fake.set(|s| s.age_ms = 0);
+        registry.peers(now).await.unwrap();
+        assert_eq!(registry.dead(), ["b"]);
+        assert!(bucket.get("nodes/b.json").await.unwrap().is_some());
+        bucket
+            .put("alarms/b/0/ns/actor/0", Vec::new(), &[])
+            .await
+            .unwrap();
+        let later = now + 11 * ttl;
+        registry.peers(later).await.unwrap();
+        assert!(bucket.get("nodes/b.json").await.unwrap().is_some());
+        bucket.delete("alarms/b/0/ns/actor/0").await.unwrap();
+        registry.peers(later).await.unwrap();
+        assert!(bucket.get("nodes/b.json").await.unwrap().is_none());
+    });
+}

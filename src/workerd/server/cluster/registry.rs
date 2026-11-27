@@ -398,11 +398,18 @@ impl Registry {
 
     /// A peer's record while the record's own lease holds: today's rule.
     async fn read_record(&self, node: &str, now_ms: u64) -> Result<Option<NodeRecord>> {
+        Ok(self.read_held(node, now_ms).await?.0)
+    }
+
+    /// As `read_record`, and whether the record is one a machine's lease
+    /// holds (`HELD_BY_MACHINE`), whose expiry says nothing.
+    async fn read_held(&self, node: &str, now_ms: u64) -> Result<(Option<NodeRecord>, bool)> {
         let Some((body, _)) = self.bucket.get(&node_key(node)).await? else {
             self.listed.borrow_mut().remove(node);
-            return Ok(None);
+            return Ok((None, false));
         };
         let record: NodeRecord = serde_json::from_slice(&body)?;
+        let held = record.machine.is_some() && record.expires_ms == HELD_BY_MACHINE;
         if record.machine.is_none()
             && record.expires_ms + DEAD_RECORD_TTLS * self.ttl_ms < now_ms
             && self
@@ -432,14 +439,14 @@ impl Registry {
             && (self.external() || (self.both && record.expires_ms == HELD_BY_MACHINE));
         if record.expires_ms <= now_ms || backed {
             self.listed.borrow_mut().remove(node);
-            return Ok(None);
+            return Ok((None, held));
         }
         // Until the next listing: one read serves every request that finds
         // the listing stale, and a stale listing is when the bucket is busy.
         self.listed
             .borrow_mut()
             .insert(node.to_owned(), record.clone());
-        Ok(Some(record))
+        Ok((Some(record), held))
     }
 
     /// Every live instance, this one included when its lease holds.
@@ -451,13 +458,35 @@ impl Registry {
             // Live by either rule: by its own record, or by its machine's
             // lease. The listing is as old as the older of the two.
             let view = agent.watch().await?;
-            let (mut peers, mut dead) = self.bucket_records(now_ms).await?;
+            let (mut peers, mut dead, held) = self.bucket_records(now_ms).await?;
             for record in view.instances.into_iter().map(NodeRecord::of) {
                 if record.expires_ms > now_ms && !peers.iter().any(|p| p.node == record.node) {
                     peers.push(record);
                 }
             }
             dead.retain(|node| !peers.iter().any(|p| &p.node == node));
+            // An `external` peer's record says nothing by its expiry: a view
+            // too old to list it proves no death (as `external_peers`). A
+            // fresh one that does not list it does, and its record goes once
+            // old enough and without alarms, as the scan of an `external`
+            // instance deletes it: a crashed one never rewrites it, and a
+            // reader without a provider would take it for live for good.
+            if view.age_ms < self.ttl_ms / 2 {
+                for (node, modified_ms) in &held {
+                    if dead.contains(node)
+                        && modified_ms + DEAD_RECORD_TTLS * self.ttl_ms < now_ms
+                        && self
+                            .bucket
+                            .list(&format!("alarms/{node}/"))
+                            .await?
+                            .is_empty()
+                    {
+                        self.bucket.delete(&node_key(node)).await?;
+                    }
+                }
+            } else {
+                dead.retain(|node| !held.iter().any(|(h, _)| h == node));
+            }
             *self.dead.borrow_mut() = dead;
             self.list(&peers, now_ms.saturating_sub(view.age_ms));
             return Ok(peers);
@@ -467,14 +496,18 @@ impl Registry {
 
     /// Every live instance by the bucket's records alone.
     async fn bucket_peers(&self, now_ms: u64) -> Result<Vec<NodeRecord>> {
-        let (peers, dead) = self.bucket_records(now_ms).await?;
+        let (peers, dead, _) = self.bucket_records(now_ms).await?;
         *self.dead.borrow_mut() = dead;
         self.list(&peers, now_ms);
         Ok(peers)
     }
 
-    /// The live records in `nodes/`, and the ids of those that are not.
-    async fn bucket_records(&self, now_ms: u64) -> Result<(Vec<NodeRecord>, Vec<String>)> {
+    /// The live records in `nodes/`, the ids of those that are not, and the
+    /// ids and modification times of the records machines' leases hold.
+    async fn bucket_records(
+        &self,
+        now_ms: u64,
+    ) -> Result<(Vec<NodeRecord>, Vec<String>, Vec<(String, u64)>)> {
         // The records are read concurrently: a lease round is bounded, and
         // reading them one after another made it time out on R2's spikes.
         let listed = self.bucket.list("nodes/").await?;
@@ -486,17 +519,23 @@ impl Registry {
         });
         let nodes: Vec<_> = nodes.collect();
         let fetched =
-            futures::future::join_all(nodes.iter().map(|n| self.read_record(n, now_ms))).await;
+            futures::future::join_all(nodes.iter().map(|n| self.read_held(n, now_ms))).await;
         let mut peers = Vec::new();
-        for record in fetched {
-            peers.extend(record?);
+        let mut held = Vec::new();
+        for (fetched, node) in fetched.into_iter().zip(&nodes) {
+            let (record, is_held) = fetched?;
+            if is_held {
+                let entry = listed.iter().find(|e| e.key == node_key(node));
+                held.push(((*node).to_owned(), entry.map_or(now_ms, |e| e.modified_ms)));
+            }
+            peers.extend(record);
         }
         let dead = nodes
             .into_iter()
             .filter(|n| !peers.iter().any(|p| p.node == *n))
             .map(str::to_owned)
             .collect();
-        Ok((peers, dead))
+        Ok((peers, dead, held))
     }
 
     /// Every live instance as the liveness provider sees them, with peers

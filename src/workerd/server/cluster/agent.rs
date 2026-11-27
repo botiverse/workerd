@@ -128,6 +128,9 @@ struct Named<'a> {
     instance: &'a str,
 }
 
+/// How many idle connections a client keeps.
+const MAX_IDLE: usize = 2;
+
 /// The largest response head and body the client reads.
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -246,7 +249,11 @@ impl Agent {
                 Error::Http(format!("liveness provider: {path}: {e}"))
             }
         })?;
-        if let Some(stream) = stream {
+        // A few kept for the next calls; a burst's others close, so that its
+        // connections do not stay open on the provider, which may cap them.
+        if let Some(stream) = stream
+            && self.idle.borrow().len() < MAX_IDLE
+        {
             self.idle.borrow_mut().push(stream);
         }
         if status != 200 {

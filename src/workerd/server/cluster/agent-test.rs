@@ -237,3 +237,19 @@ fn the_monotonic_clock_starts_above_zero() {
     assert!(a >= 1);
     assert!(mono_ms() >= a);
 }
+
+#[test]
+fn a_burst_keeps_few_connections() {
+    run(async {
+        let path = socket_path();
+        let connections = serve(&path, Framing::Length, provider);
+        let agent = Agent::new(path.clone());
+        let calls: Vec<_> = (0..6).map(|_| agent.watch()).collect();
+        for answer in futures::future::join_all(calls).await {
+            answer.unwrap();
+        }
+        assert_eq!(connections.get(), 6);
+        assert_eq!(agent.idle.borrow().len(), MAX_IDLE);
+        let _ = std::fs::remove_file(&path);
+    });
+}
