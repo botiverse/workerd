@@ -48,50 +48,100 @@ use crate::Bucket;
 use crate::Error;
 use crate::Registry;
 use crate::Result;
+use crate::agent::Agent;
+use crate::agent::Liveness;
+use crate::agent::mono_ms;
 use crate::cluster::now_ms;
 use crate::http::Repeat;
 use crate::http::prompt;
 
 /// The lease's expiry, as its keeper last renewed it: what the loop thread
 /// reads. Clones share it.
+///
+/// With an external liveness provider (`Liveness`), the lease is the
+/// provider's grant instead, or as well: its deadline is on this process's
+/// monotonic clock (`agent::mono_ms`), from when the request that won it was
+/// sent, and needs no margin, as the provider's grant leaves the time peers'
+/// clocks may be ahead. With both, the lease holds while both do.
 #[derive(Clone)]
 pub struct Held {
     /// 0 before the first renewal.
     until_ms: Arc<AtomicU64>,
+    /// The grant's deadline, by `mono_ms`; 0 before the first.
+    granted_ms: Arc<AtomicU64>,
     /// Whether the instance left the cluster (`Keeper::deregister`).
     left: Arc<AtomicBool>,
     timing: Timing,
+    /// Whether the bucket lease counts, and whether the grant does.
+    bucket: bool,
+    agent: bool,
 }
 
 impl Held {
-    fn new(timing: Timing) -> Self {
+    fn new(timing: Timing, liveness: &Liveness) -> Self {
         Self {
             until_ms: Arc::default(),
+            granted_ms: Arc::default(),
             left: Arc::default(),
             timing,
+            bucket: liveness.renews_record(),
+            agent: liveness.socket().is_some(),
         }
+    }
+
+    /// How much longer the grant holds, in ms by `mono_ms`: 0 once it does
+    /// not.
+    fn grant_remaining_ms(&self) -> u64 {
+        self.granted_ms
+            .load(Ordering::Acquire)
+            .saturating_sub(mono_ms())
     }
 
     /// Whether the lease holds at `now_ms`, with peers' clocks allowed for.
     pub fn holds(&self, now_ms: u64) -> bool {
-        self.timing
-            .holds(self.until_ms.load(Ordering::Acquire), now_ms)
+        (!self.bucket
+            || self
+                .timing
+                .holds(self.until_ms.load(Ordering::Acquire), now_ms))
+            && (!self.agent || self.grant_remaining_ms() > 0)
     }
 
     /// How much longer than `now_ms` the lease holds: zero once it does
     /// not.
     pub fn remaining(&self, now_ms: u64) -> Duration {
-        let until_ms = self.until_ms.load(Ordering::Acquire);
-        ms(self.timing.remaining_ms(until_ms, now_ms))
+        let mut remaining = u64::MAX;
+        if self.bucket {
+            let until_ms = self.until_ms.load(Ordering::Acquire);
+            remaining = self.timing.remaining_ms(until_ms, now_ms);
+        }
+        if self.agent {
+            remaining = remaining.min(self.grant_remaining_ms());
+        }
+        ms(remaining)
     }
 
-    /// [`Lease::holds_until`] of the lease its keeper keeps.
+    /// [`Lease::holds_until`] of the lease its keeper keeps, by the wall
+    /// clock: a grant's deadline as far past `now_ms()` as it is past
+    /// `mono_ms()`.
     pub fn holds_until(&self) -> u64 {
         if self.left.load(Ordering::Acquire) {
             return 0;
         }
-        self.timing
-            .holds_until(self.until_ms.load(Ordering::Acquire))
+        let mut until = u64::MAX;
+        if self.bucket {
+            until = self
+                .timing
+                .holds_until(self.until_ms.load(Ordering::Acquire));
+        }
+        if self.agent {
+            let remaining = self.grant_remaining_ms();
+            until = until.min(if remaining == 0 {
+                0
+            } else {
+                now_ms() + remaining
+            });
+        }
+        until
     }
 }
 
@@ -101,19 +151,35 @@ pub struct Keeper {
     registry: Rc<Registry>,
     /// Measures this node's clock against the bucket's.
     bucket: Bucket,
+    /// The liveness provider that grants the lease, if one does.
+    agent: Option<Agent>,
     lease: RefCell<Lease>,
+    /// The provider's grant, by `mono_ms`, with no margin for peers' clocks:
+    /// the provider's grant leaves it.
+    grant: RefCell<Lease>,
     held: Held,
     /// The loop the rounds watch, from `watch` on.
     watched: RefCell<Option<Progress>>,
 }
 
 impl Keeper {
-    pub fn new(bucket: Bucket, registry: Rc<Registry>, timing: Timing) -> Self {
+    /// A keeper whose lease `liveness` keeps.
+    pub fn with(
+        bucket: Bucket,
+        registry: Rc<Registry>,
+        timing: Timing,
+        liveness: &Liveness,
+    ) -> Self {
         Self {
             registry,
             bucket,
+            agent: liveness.socket().map(|socket| Agent::new(socket.clone())),
             lease: RefCell::new(Lease::new(timing)),
-            held: Held::new(timing),
+            grant: RefCell::new(Lease::new(Timing {
+                max_skew_ms: 0,
+                ..timing
+            })),
+            held: Held::new(timing, liveness),
             watched: RefCell::new(None),
         }
     }
@@ -154,6 +220,16 @@ impl Keeper {
         self.lease.borrow_mut().renewed(now_ms, result)
     }
 
+    /// Reports a heartbeat's or registration's outcome: the grant's new
+    /// deadline by `mono_ms`, or why it failed. The latest answer stands,
+    /// even when shorter: it is what the provider can grant now.
+    fn granted(&self, result: std::result::Result<u64, String>) -> Step {
+        if let Ok(deadline) = result {
+            self.held.granted_ms.store(deadline, Ordering::Release);
+        }
+        self.grant.borrow_mut().renewed(mono_ms(), result)
+    }
+
     /// Keeps the lease until the node must stop serving, or until the
     /// loop it watches (`watch`) makes no progress: answers why. Runs for
     /// the life of the process.
@@ -167,26 +243,13 @@ impl Keeper {
             if self.lease.borrow().left {
                 std::future::pending::<()>().await;
             }
-            let observed = lease::Observed {
-                now_ms: now_ms(),
-                skew_ms: self.clock_skew_ms(),
-            };
-            let mut step = self.lease.borrow().before_renew(&observed);
-            if step == Step::Renew {
-                let renew = timeout(ms(timing.renew_timeout_ms), self.renew_round());
-                let result = match renew.await {
-                    Ok(Ok(until)) => Ok(until),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("renewal timed out".into()),
-                };
-                // The instance left meanwhile, which may have failed this
-                // renewal: what it found no longer matters.
-                if self.lease.borrow().left {
-                    continue;
-                }
-                step = self.renewed(result);
+            let (bucket, agent) = futures::join!(self.bucket_round(), self.agent_round());
+            // The instance left meanwhile, which may have failed this
+            // renewal: what it found no longer matters.
+            if self.lease.borrow().left {
+                continue;
             }
-            let delay = match step {
+            let delay = match worse(bucket, agent) {
                 Step::Fence(reason) => return lease_lost(reason),
                 Step::Retry(reason) => {
                     tracing::warn!("renewing the cluster lease failed; retrying: {reason}");
@@ -209,6 +272,74 @@ impl Keeper {
         }
     }
 
+    /// A round's renewal of the record in the bucket, if the instance renews
+    /// one.
+    async fn bucket_round(&self) -> Step {
+        if !self.held.bucket {
+            return Step::Renew;
+        }
+        let timing = self.held.timing;
+        let observed = lease::Observed {
+            now_ms: now_ms(),
+            skew_ms: self.clock_skew_ms(),
+        };
+        let step = self.lease.borrow().before_renew(&observed);
+        if step != Step::Renew {
+            return step;
+        }
+        let renew = timeout(ms(timing.renew_timeout_ms), self.renew_round());
+        let result = match renew.await {
+            Ok(Ok(until)) => Ok(until),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("renewal timed out".into()),
+        };
+        if self.lease.borrow().left {
+            return Step::Renew;
+        }
+        self.renewed(result)
+    }
+
+    /// A round's heartbeat to the liveness provider, if one grants the
+    /// lease. The provider checks the machine's clock against the bucket's.
+    async fn agent_round(&self) -> Step {
+        if self.agent.is_none() {
+            return Step::Renew;
+        }
+        let observed = lease::Observed {
+            now_ms: mono_ms(),
+            skew_ms: 0,
+        };
+        let step = self.grant.borrow().before_renew(&observed);
+        if step != Step::Renew {
+            return step;
+        }
+        let result = self.heartbeat().await;
+        if self.lease.borrow().left {
+            return Step::Renew;
+        }
+        self.granted(result)
+    }
+
+    /// A heartbeat, bounded as a renewal is: the grant's deadline, from when
+    /// it was sent, or why it failed.
+    async fn heartbeat(&self) -> std::result::Result<u64, String> {
+        let Some(agent) = &self.agent else {
+            return Err("no liveness provider".into());
+        };
+        let progress = self
+            .watched
+            .borrow()
+            .as_ref()
+            .map_or(0, |progress| progress());
+        let sent = mono_ms();
+        let beat = agent.heartbeat(self.registry.node(), progress, self.registry.draining());
+        match timeout(ms(self.held.timing.renew_timeout_ms), beat).await {
+            Ok(Ok(grant)) => Ok(sent.saturating_add(grant.valid_for_ms)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("the liveness provider did not answer in time".into()),
+        }
+    }
+
     /// A lease round's renewal. A request of it that stalls is sent once
     /// more (`http::prompt`), so that one slow answer does not time the
     /// round out: two rounds timed out in a row fence the node. The
@@ -221,11 +352,47 @@ impl Keeper {
     }
 
     /// Renews the lease outside the maintenance rounds, whether or not it
-    /// lapsed: as the node joins, before the rounds start.
-    pub async fn take_lease(&self) -> Result<()> {
-        let until = self.registry.renew(now_ms()).await?;
-        self.renewed(Ok(until));
-        Ok(())
+    /// lapsed: as the node joins, before the rounds start. With a liveness
+    /// provider, registers with it first; one that is not up yet, or has no
+    /// lease to grant from yet, as its machine starts, is asked again for up
+    /// to a lease.
+    /// Answers the machine the provider placed the instance on.
+    pub async fn take_lease(&self) -> Result<Option<String>> {
+        let mut machine = None;
+        if let Some(agent) = &self.agent {
+            let timing = self.held.timing;
+            let deadline = mono_ms() + timing.lease_ms;
+            let grant = loop {
+                let sent = mono_ms();
+                let registered = agent
+                    .register(
+                        self.registry.node(),
+                        self.registry.advertise(),
+                        self.registry.draining(),
+                    )
+                    .await;
+                match registered {
+                    Ok(grant) if grant.valid_for_ms > 0 => break (sent, grant),
+                    Ok(_) if mono_ms() < deadline => {}
+                    // Not listening yet, or not holding its own lease yet.
+                    Err(Error::Http(_)) if mono_ms() < deadline => {}
+                    Ok(_) => {
+                        return Err(Error::Http("the liveness provider grants no lease".into()));
+                    }
+                    Err(e) => return Err(e),
+                }
+                tokio::time::sleep(ms(timing.retry_ms)).await;
+            };
+            let (sent, grant) = grant;
+            machine = grant.machine.clone();
+            self.registry.set_machine(machine.clone());
+            self.granted(Ok(sent.saturating_add(grant.valid_for_ms)));
+        }
+        if self.held.bucket {
+            let until = self.registry.renew(now_ms()).await?;
+            self.renewed(Ok(until));
+        }
+        Ok(machine)
     }
 
     /// The record says that this instance drains from its next renewal.
@@ -236,15 +403,23 @@ impl Keeper {
     /// Publishes that this instance drains, so that peers choose it for no
     /// object or alarm.
     pub async fn announce_draining(&self) {
-        let renew = timeout(ms(self.held.timing.renew_timeout_ms), self.renew_round());
-        match renew.await {
-            Ok(Ok(_)) => {}
-            // The node left the cluster first: `deregister`, which runs at
-            // once on a node with nothing to hand off, published its record
-            // expired and draining.
-            Ok(Err(Error::NotHere(_))) if self.registry.left() => {}
-            Ok(Err(e)) => tracing::warn!("cluster: publishing the drain failed: {e}"),
-            Err(_) => tracing::warn!("cluster: publishing the drain timed out"),
+        if self.held.bucket {
+            let renew = timeout(ms(self.held.timing.renew_timeout_ms), self.renew_round());
+            match renew.await {
+                Ok(Ok(_)) => {}
+                // The node left the cluster first: `deregister`, which runs at
+                // once on a node with nothing to hand off, published its record
+                // expired and draining.
+                Ok(Err(Error::NotHere(_))) if self.registry.left() => {}
+                Ok(Err(e)) => tracing::warn!("cluster: publishing the drain failed: {e}"),
+                Err(_) => tracing::warn!("cluster: publishing the drain timed out"),
+            }
+        }
+        if self.agent.is_some() && !self.lease.borrow().left {
+            match self.heartbeat().await {
+                Ok(deadline) => drop(self.granted(Ok(deadline))),
+                Err(e) => tracing::warn!("cluster: publishing the drain failed: {e}"),
+            }
         }
     }
 
@@ -252,7 +427,23 @@ impl Keeper {
     pub async fn deregister(&self) -> Result<()> {
         self.lease.borrow_mut().left = true;
         self.held.left.store(true, Ordering::Release);
-        self.registry.deregister().await
+        let left = match &self.agent {
+            Some(agent) => agent.deregister(self.registry.node()).await,
+            None => Ok(()),
+        };
+        // A record the instance never wrote (`Liveness::External`) is left
+        // to the loop thread, which wrote it.
+        self.registry.deregister().await.and(left)
+    }
+}
+
+/// The step that two rounds' outcomes make together: a fence if either
+/// fences, a retry if either failed.
+fn worse(a: Step, b: Step) -> Step {
+    match (a, b) {
+        (Step::Fence(reason), _) | (_, Step::Fence(reason)) => Step::Fence(reason),
+        (Step::Retry(reason), _) | (_, Step::Retry(reason)) => Step::Retry(reason),
+        (Step::Renew, Step::Renew) => Step::Renew,
     }
 }
 
@@ -260,7 +451,7 @@ impl Keeper {
 /// beside the maintenance rounds, so none waits for a round's renewal.
 enum Command {
     /// `Keeper::take_lease`.
-    Take(oneshot::Sender<Result<()>>),
+    Take(oneshot::Sender<Result<Option<String>>>),
     /// Start `Keeper::maintain`, once.
     Maintain,
     /// `Keeper::watch`.
@@ -327,6 +518,7 @@ impl Thread {
         node: String,
         address: String,
         timing: Timing,
+        liveness: Liveness,
         fence: Fence,
         within: Within,
     ) -> Result<Self> {
@@ -346,7 +538,8 @@ impl Thread {
                     };
                     let registry = Registry::new(bucket.clone(), &node, &address, timing.lease_ms)
                         .contended_pause(ms(timing.contended_pause_ms));
-                    Ok((runtime, Keeper::new(bucket, Rc::new(registry), timing)))
+                    let keeper = Keeper::with(bucket, Rc::new(registry), timing, &liveness);
+                    Ok((runtime, keeper))
                 });
                 let (runtime, keeper) = match keeper {
                     Ok(keeper) => keeper,
@@ -387,7 +580,7 @@ impl Thread {
         &self.held
     }
 
-    pub async fn take_lease(&self) -> Result<()> {
+    pub async fn take_lease(&self) -> Result<Option<String>> {
         self.ask(Command::Take).await?
     }
 
@@ -573,7 +766,7 @@ impl Lessee {
         }
     }
 
-    pub async fn take_lease(&self) -> Result<()> {
+    pub async fn take_lease(&self) -> Result<Option<String>> {
         match self {
             Self::Thread(thread) => thread.take_lease().await,
             #[cfg(test)]

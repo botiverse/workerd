@@ -28,6 +28,7 @@ fn a_renewal_whose_answer_was_lost_is_not_a_fence() {
             instance: a.instance,
             draining: false,
             write: 0,
+            machine: None,
         };
         let body = serde_json::to_vec(&landed).unwrap();
         bucket.put(&node_key("a"), body, &[]).await.unwrap();
@@ -148,6 +149,7 @@ fn two_late_renewals_of_ours_are_not_a_fence() {
                 instance: a.instance,
                 draining: false,
                 write: 0,
+                machine: None,
             };
             serde_json::to_vec(&record).unwrap()
         };
@@ -193,6 +195,7 @@ fn a_deregistration_outlasts_a_renewal_of_ours_that_landed_first() {
             instance: a.instance,
             draining: false,
             write: 0,
+            machine: None,
         };
         let body = serde_json::to_vec(&landed).unwrap();
         bucket.put(&node_key("a"), body, &[]).await.unwrap();

@@ -330,6 +330,34 @@ struct ClusterConfig {
   # `stopTimeoutMs` is not divided. A divisor of 0, or one that rounds a time down to 0 (above
   # 1000), fails the config. Bucket requests that stall past the shortened bounds fence the
   # instance, so leave this at 1 outside tests.
+
+  liveness :union {
+    # Where this instance's lease, and its view of which peers live, come from.
+
+    bucket @8 :Void;
+    # Its own record in the bucket, `nodes/<instance>.json`, renewed every 3 seconds by a
+    # conditional write; each instance lists and reads every record as often. The default.
+
+    external @9 :Text;
+    # A liveness provider on this machine, at the unix socket this names, such as a host agent
+    # that holds one lease in the bucket for every instance on the machine: many instances per
+    # machine then cost the bucket what one does. The provider speaks HTTP/1.1 with JSON bodies
+    # (`src/workerd/server/cluster/agent.rs` documents the calls). The instance registers as it
+    # joins, sends a heartbeat every 3 seconds, and serves only while the provider's latest grant
+    # holds: `validForMs` from when it sent the request, by its own monotonic clock. It asks the
+    # provider, rather than the bucket, which peers live, and whether an object's owner lives
+    # before taking it over. Its record in the bucket is written as it joins and as it leaves,
+    # naming its machine, so that peers find its alarms once it is gone. The provider must tell
+    # the caller's cluster from the connection, not from the request, and must not stop listing
+    # an instance in its lease before it has seen the instance's process exit or its last grant
+    # end. A provider that stops answering fences the instance once its grant runs out.
+
+    both @10 :Text;
+    # `external` and `bucket` at once, for a rolling switch between them: the instance renews
+    # its own record and registers with the provider at this socket, serves only while both
+    # hold, and takes a peer for live if either its record or the provider says so. Switch every
+    # instance to `both` before any to `external`, and back to `both` before any to `bucket`.
+  }
 }
 
 struct TracingOptions {

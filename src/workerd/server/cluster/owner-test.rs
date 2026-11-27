@@ -334,6 +334,7 @@ impl Sim {
                 ..Timing::DEFAULT
             },
             key: Vec::new(),
+            liveness: crate::Liveness::Bucket,
         };
         self.clusters
             .push(Cluster::over(self.dst.bucket.clone(), setup));

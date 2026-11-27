@@ -11,6 +11,9 @@
 //!
 //! - `nodes/<node>.json`: one per running instance, with its address and a
 //!   lease expiry the instance renews. A peer is live while its lease is.
+//!   With an external liveness provider (`agent.rs`), the provider's lease of
+//!   the instance's machine says instead, and the record, written as the
+//!   instance joins and leaves, names the machine.
 //! - `do/<namespace>/<actor>/own.json`: one per Durable Object, naming its
 //!   owner and an ownership epoch. A claim is a conditional write; taking an
 //!   object over from an owner whose lease expired bumps the epoch.
@@ -39,6 +42,7 @@
     clippy::unwrap_used
 )]
 
+mod agent;
 mod alarms;
 mod bucket;
 mod capture;
@@ -62,6 +66,7 @@ mod ownership;
 mod registry;
 pub mod s3;
 
+pub use agent::Liveness;
 pub use alarms::Adopted;
 pub use bucket::Body;
 pub use bucket::Bucket;

@@ -94,7 +94,16 @@ fn start_within(
     let fenced = Box::new(move |reason, remaining| {
         let _ = fenced.send((reason, now_ms(), remaining));
     });
-    let thread = Thread::spawn(open, "a".into(), "a:1".into(), timing, fenced, within).unwrap();
+    let thread = Thread::spawn(
+        open,
+        "a".into(),
+        "a:1".into(),
+        timing,
+        Liveness::Bucket,
+        fenced,
+        within,
+    )
+    .unwrap();
     (thread, down, fence)
 }
 
@@ -192,7 +201,15 @@ fn a_node_that_left_renews_no_more() {
 fn a_bucket_that_does_not_open_fails_the_start() {
     let open = || Err(Error::Config("no such bucket".into()));
     let fence = Box::new(|_, _| {});
-    let started = Thread::spawn(open, "a".into(), "a:1".into(), timing(100), fence, here());
+    let started = Thread::spawn(
+        open,
+        "a".into(),
+        "a:1".into(),
+        timing(100),
+        Liveness::Bucket,
+        fence,
+        here(),
+    );
     assert!(matches!(started, Err(Error::Config(_))));
 }
 

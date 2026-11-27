@@ -53,6 +53,11 @@
 //      large value in the bucket, and tokens come from the metadata server,
 //      replaced before they expire, or from a service account key's signed
 //      JWT.
+//  15a. External liveness (`ClusterConfig.liveness`, fake-agent.mjs): no
+//      lease record is renewed, a killed owner is taken over as soon as its
+//      provider sees it exit, a provider away within a grant fences nothing
+//      and one away for good fences the node within its grant, and `both`
+//      and `external` instances serve one cluster.
 //  16. The Cache API is one cache across the nodes (services/cache-cluster.rs,
 //      over `ClusterNode::peer_service`): a write is seen at once on the
 //      other node, named caches are apart, a large value crosses, and a
@@ -78,12 +83,13 @@ import {
   generateKeyPairSync,
   randomBytes,
 } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { env } from 'node:process';
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { FakeS3Server } from './fake-s3.mjs';
+import { FakeAgents } from './fake-agent.mjs';
 
 assert(
   env.WORKERD_BINARY !== undefined,
@@ -147,6 +153,7 @@ class ClusterNode {
   #disk;
   #configName;
   #env;
+  #cwd;
 
   // `localPath` is the directory of the config's disk service `disk`. `env`
   // adds to the process's environment, or with `undefined` removes from it.
@@ -160,8 +167,10 @@ class ClusterNode {
     nodeId,
     extraArgs = [],
     env = {},
+    cwd,
   }) {
     this.#env = env;
+    this.#cwd = cwd;
     this.#extraArgs = extraArgs;
     this.#disk = disk;
     this.#configName = configName;
@@ -223,9 +232,12 @@ class ClusterNode {
   async start() {
     assert.strictEqual(this.#child, null);
 
+    // In a directory of its own, the binary and the config are found from
+    // the test's.
+    const here = (path) => (this.#cwd === undefined ? path : resolve(path));
     const args = [
       'serve',
-      this.#config,
+      here(this.#config),
       ...(this.#configName === undefined ? [] : [this.#configName]),
       '--experimental',
       '--verbose',
@@ -237,8 +249,9 @@ class ClusterNode {
     }
     args.push(...this.#extraArgs);
 
-    const child = spawn(this.#binary, args, {
+    const child = spawn(here(this.#binary), args, {
       stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+      cwd: this.#cwd,
       env: {
         ...env,
         // Drop the runtime on exit, joining its threads, which TSan reports
@@ -552,7 +565,8 @@ class FakeS3 {
 //   bucket     the FakeS3
 //   nodeKeys   Map from nodeId to the node's key (32-char hex), which is also
 //              what owner records name
-// The nodes run the config constant `configName` of `config`, whose disk
+// The nodes run the config constant `configName` of `config` (or
+// `configName(i)` for node i), in directory `cwd(i)` if given, whose disk
 // service `disk` is a directory of each node's own, once `before` has prepared
 // the bucket, of `dialect` ("s3" or "gcs", FakeS3.fresh). `nodeEnv` answers
 // what a node adds to its environment.
@@ -567,6 +581,7 @@ async function withCluster(
     before = async () => {},
     dialect = 's3',
     nodeEnv = () => ({}),
+    cwd = () => undefined,
   } = {}
 ) {
   // Each test run gets its own bucket and disks, so state doesn't leak
@@ -584,13 +599,15 @@ async function withCluster(
         new ClusterNode({
           binary: env.WORKERD_BINARY,
           config,
-          configName,
+          configName:
+            typeof configName === 'function' ? configName(i) : configName,
           localPath,
           disk,
           s3Port: bucket.port,
           nodeId: `node${i}`,
           extraArgs: await extraArgs(i),
           env: nodeEnv(bucket),
+          cwd: cwd(i),
         })
       );
     }
@@ -1680,6 +1697,153 @@ test('cluster: a node whose event loop makes no progress fences', async () => {
       await wedged;
     },
     { configName: 'shortLease' }
+  );
+});
+
+// External liveness (`ClusterConfig.liveness`): each node's lease is a grant
+// from a provider on its "machine" (fake-agent.mjs), here one machine per
+// node, each a directory that the node runs in. A grant lasts what a
+// provider's would with this divisor: the lease less peers' clock margin.
+const GRANT_MS = (20_000 - 4_000) / TIME_DIVISOR;
+
+// Runs `fn` with `withCluster`'s arguments and `agents`, the nodes on
+// machines m0, m1, ... of their own, of `configName`.
+async function withMachines(numNodes, fn, { configName = 'external' } = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'wd-machines-'));
+  const agents = new FakeAgents({ validForMs: GRANT_MS, leaseMs: LEASE_MS });
+  const dirs = [];
+  try {
+    for (let i = 0; i < numNodes; i++) {
+      dirs.push(join(root, `m${i}`));
+      await mkdir(dirs[i]);
+      await agents.start(`m${i}`, dirs[i]);
+    }
+    await withCluster(numNodes, (cluster) => fn({ ...cluster, agents, dirs }), {
+      configName,
+      cwd: (i) => dirs[i],
+    });
+  } finally {
+    await agents.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+// Polls `/get?name=<name>` on `node` until it answers 200: the answer, and
+// how long that took.
+async function getUntilServed(node, name, ms = 30_000) {
+  const start = Date.now();
+  let last = null;
+  while (Date.now() < start + ms) {
+    try {
+      const r = await fetchJson(node.httpPort, `/get?name=${name}`, {
+        timeoutMs: 10_000,
+      });
+      if (r.status === 200) return { response: r, took: Date.now() - start };
+      last = JSON.stringify(r.body);
+    } catch (e) {
+      last = e;
+    }
+    await sleep(50);
+  }
+  assert.fail(`${node.nodeId} never served ${name}: ${last}`);
+}
+
+test('cluster: external liveness: no lease record is renewed, and a killed owner is taken over at once', async () => {
+  await withMachines(2, async ({ nodes, bucket, nodeKeys, agents }) => {
+    // Each record is written once, naming its machine, never renewed.
+    const records = async () =>
+      Promise.all(
+        nodes.map(async (n) =>
+          JSON.parse(await bucket.get(`nodes/${nodeKeys.get(n.nodeId)}.json`))
+        )
+      );
+    const before = await records();
+    assert.deepStrictEqual(
+      before.map((r) => [r.expires_ms, r.machine]),
+      [
+        [0, 'm0'],
+        [0, 'm1'],
+      ]
+    );
+    const first = await fetchJson(nodes[1].httpPort, '/increment?name=ext');
+    assert.strictEqual(first.status, 200);
+    await sleep(4 * RENEW_INTERVAL_MS);
+    assert.deepStrictEqual(await records(), before);
+    const beats = agents.calls.filter((c) => c.path === '/v1/heartbeat');
+    assert(beats.length >= 4, `${beats.length} heartbeats`);
+
+    // The owner is killed; its provider sees the exit and drops it from its
+    // machine's lease. The survivor's next claim asks, and takes over well
+    // within a lease.
+    const owner = nodes.find((n) => n.nodeId === first.body.nodeId);
+    const survivor = nodes.find((n) => n !== owner);
+    await owner.stop({ signal: 'SIGKILL', timeoutMs: 2000 });
+    agents.exited(nodeKeys.get(owner.nodeId));
+    const { response, took } = await getUntilServed(survivor, 'ext');
+    assert.strictEqual(response.body.nodeId, survivor.nodeId);
+    assert.strictEqual(response.body.count, 1);
+    assert(took < LEASE_MS / 2, `taken over after ${took} ms`);
+  });
+});
+
+test('cluster: external liveness: a provider away within the grant fences nothing; away for good, the node fences within its grant', async () => {
+  await withMachines(1, async ({ nodes, agents, dirs }) => {
+    const [node] = nodes;
+    const served = await fetchJson(node.httpPort, '/increment?name=away');
+    assert.strictEqual(served.status, 200);
+    // Away for less than what is left of a grant less a renewal's bound.
+    await agents.kill('m0');
+    await sleep(GRANT_MS / 3);
+    await agents.start('m0', dirs[0]);
+    await sleep(GRANT_MS);
+    const still = await fetchJson(node.httpPort, '/increment?name=away');
+    assert.strictEqual(still.status, 200);
+    assert.strictEqual(still.body.count, 2);
+    assert.doesNotMatch(node.stderr, /leaving the cluster/);
+    // Away for good.
+    const killed = Date.now();
+    await agents.kill('m0');
+    const { code } = await node.exited({ timeoutMs: 3 * GRANT_MS });
+    const took = Date.now() - killed;
+    assert.strictEqual(code, 1);
+    assert.match(node.stderr, /leaving the cluster: its lease cannot be kept/);
+    assert(took <= GRANT_MS + 500, `fenced after ${took} ms`);
+  });
+});
+
+test('cluster: liveness both and external instances serve one cluster', async () => {
+  await withMachines(
+    2,
+    async ({ nodes, bucket, nodeKeys, agents }) => {
+      const record = async (n) =>
+        JSON.parse(await bucket.get(`nodes/${nodeKeys.get(n.nodeId)}.json`));
+      // `both` renews its record, which names its machine; `external` does not.
+      const a = await record(nodes[0]);
+      assert(a.expires_ms > Date.now(), JSON.stringify(a));
+      assert.strictEqual(a.machine, 'm0');
+      assert.strictEqual((await record(nodes[1])).expires_ms, 0);
+      const counts = [];
+      const owners = new Set();
+      for (let i = 0; i < 6; i++) {
+        const r = await fetchJson(
+          nodes[i % 2].httpPort,
+          '/increment?name=mixed'
+        );
+        assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+        counts.push(r.body.count);
+        owners.add(r.body.nodeId);
+      }
+      assert.deepStrictEqual(counts, [1, 2, 3, 4, 5, 6]);
+      assert.strictEqual(owners.size, 1);
+      const owner = nodes.find((n) => owners.has(n.nodeId));
+      const survivor = nodes.find((n) => n !== owner);
+      await owner.stop({ signal: 'SIGKILL', timeoutMs: 2000 });
+      agents.exited(nodeKeys.get(owner.nodeId));
+      const { response } = await getUntilServed(survivor, 'mixed');
+      assert.strictEqual(response.body.count, 6);
+      assert.strictEqual(response.body.nodeId, survivor.nodeId);
+    },
+    { configName: (i) => (i === 0 ? 'both' : 'external') }
   );
 });
 

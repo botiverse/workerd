@@ -21,6 +21,7 @@ load("@aspect_rules_js//js:defs.bzl", "js_test")
         ":cluster-router.js",
         ":cluster-test.wd-test",
         ":cluster-worker.js",
+        ":fake-agent.mjs",
         ":fake-s3.mjs",
         "//src/workerd/server:workerd",
     ],

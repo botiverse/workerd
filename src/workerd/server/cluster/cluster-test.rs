@@ -44,6 +44,7 @@ fn the_lease_holds_however_long_startup_takes_after_join() {
         address: "a:1".into(),
         timing,
         key: vec![0; 32],
+        liveness: crate::Liveness::Bucket,
     };
     let (fenced, fence) = mpsc::channel();
     let cluster = Cluster::threaded(
@@ -145,6 +146,7 @@ fn cluster(bucket: &Bucket, node: &str) -> Rc<Cluster> {
         address: format!("{node}:1"),
         timing: Timing::DEFAULT,
         key: Vec::new(),
+        liveness: crate::Liveness::Bucket,
     };
     Cluster::over(bucket.clone(), setup)
 }

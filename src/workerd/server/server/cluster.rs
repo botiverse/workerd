@@ -504,7 +504,18 @@ impl ClusterNode {
                 "cluster: unsafeTimeDivisor {divisor} rounds a lease time down to 0 ms"
             ));
         };
+        let liveness = match conf.get_liveness().which() {
+            Ok(cluster_config::liveness::Bucket(())) => cluster::Liveness::Bucket,
+            Ok(cluster_config::liveness::External(socket)) => {
+                cluster::Liveness::External(socket_path(socket)?)
+            }
+            Ok(cluster_config::liveness::Both(socket)) => {
+                cluster::Liveness::Both(socket_path(socket)?)
+            }
+            Err(e) => return Err(kj::failed!("cluster: liveness: {e}")),
+        };
         let setup = cluster::Setup {
+            liveness,
             url: text(conf.get_bucket())?,
             options: options.iter().map(text).collect::<Result<_>>()?,
             node: new_node_id(),
@@ -1045,6 +1056,18 @@ impl Handler for PeerConnection {
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `liveness`'s socket: a path, which a unix socket address holds.
+fn socket_path(reader: capnp::Result<capnp::text::Reader<'_>>) -> Result<std::path::PathBuf> {
+    let path = text(reader)?;
+    // `sockaddr_un`'s path, with its terminating NUL.
+    if path.is_empty() || path.len() >= 108 {
+        return Err(kj::failed!(
+            "cluster: liveness: a socket path of 1 to 107 bytes, not {path:?}"
+        ));
+    }
+    Ok(path.into())
 }
 
 fn text(reader: capnp::Result<capnp::text::Reader<'_>>) -> Result<String> {

@@ -85,6 +85,37 @@ const shortLease :Workerd.Config = (
   ),
 );
 
+# As `config`, its lease and its peers' liveness from a provider on its machine (fake-agent.mjs),
+# at `liveness.sock` in the directory each instance runs in.
+const external :Workerd.Config = (
+  services = .services,
+  sockets = .sockets,
+  cluster = (
+    bucket = "s3://wdtest/cluster",
+    bucketOptions = .bucketOptions,
+    address = "127.0.0.1:0",
+    key = "test-cluster-shared-secret-of-32-bytes",
+    stopTimeoutMs = 10000,
+    unsafeTimeDivisor = 4,
+    liveness = (external = "liveness.sock"),
+  ),
+);
+
+# As `external`, renewing its own lease record as well.
+const both :Workerd.Config = (
+  services = .services,
+  sockets = .sockets,
+  cluster = (
+    bucket = "s3://wdtest/cluster",
+    bucketOptions = .bucketOptions,
+    address = "127.0.0.1:0",
+    key = "test-cluster-shared-secret-of-32-bytes",
+    stopTimeoutMs = 10000,
+    unsafeTimeDivisor = 4,
+    liveness = (both = "liveness.sock"),
+  ),
+);
+
 const services :List(Workerd.Service) = [
   ( name = "local",
     disk = (

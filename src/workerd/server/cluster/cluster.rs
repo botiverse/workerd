@@ -28,6 +28,8 @@ use crate::Guard;
 use crate::Ownership;
 use crate::Registry;
 use crate::Result;
+use crate::agent::Agent;
+use crate::agent::Liveness;
 use crate::alarms::Adopted;
 use crate::alarms::Index;
 use crate::gcs::Gcs;
@@ -69,6 +71,8 @@ pub struct Setup {
     pub timing: Timing,
     /// The cluster secret: MACs every peer call.
     pub key: Vec<u8>,
+    /// Where this instance's lease and its peers' liveness come from.
+    pub liveness: Liveness,
 }
 
 /// Where a Durable Object runs.
@@ -97,6 +101,7 @@ pub struct Cluster {
     key: Vec<u8>,
     lessee: Lessee,
     timing: Timing,
+    liveness: Liveness,
     /// When the registration, `join`'s renewal, answered.
     registered: Cell<Option<u64>>,
     alarms: Index,
@@ -130,6 +135,7 @@ impl Cluster {
             setup.node.clone(),
             setup.address.clone(),
             setup.timing,
+            setup.liveness.clone(),
             fence,
             within,
         )?);
@@ -140,9 +146,9 @@ impl Cluster {
     /// calls `renew`.
     #[cfg(test)]
     pub(crate) fn over(bucket: Bucket, setup: Setup) -> Rc<Self> {
-        let timing = setup.timing;
+        let (timing, liveness) = (setup.timing, setup.liveness.clone());
         Self::with(bucket.clone(), setup, |registry| {
-            Lessee::Here(Keeper::new(bucket, Rc::clone(registry), timing))
+            Lessee::Here(Keeper::with(bucket, Rc::clone(registry), timing, &liveness))
         })
     }
 
@@ -157,7 +163,12 @@ impl Cluster {
             &setup.address,
             setup.timing.lease_ms,
         );
-        let registry = Rc::new(registry.contended_pause(ms(setup.timing.contended_pause_ms)));
+        let mut registry = registry.contended_pause(ms(setup.timing.contended_pause_ms));
+        if let Some(socket) = setup.liveness.socket() {
+            let both = setup.liveness.renews_record();
+            registry = registry.with_agent(Rc::new(Agent::new(socket.clone())), both);
+        }
+        let registry = Rc::new(registry);
         Rc::new(Self {
             alarms: Index::new(
                 bucket.clone(),
@@ -173,6 +184,7 @@ impl Cluster {
             claims: RefCell::new(HashMap::new()),
             key: setup.key,
             timing: setup.timing,
+            liveness: setup.liveness,
             registered: Cell::new(None),
         })
     }
@@ -198,7 +210,15 @@ impl Cluster {
     /// and peers take over what it still owns and adopt its alarms.
     pub async fn deregister(&self) -> Result<()> {
         self.registry.leave();
-        self.lessee.deregister().await
+        let left = self.lessee.deregister().await;
+        // The record this thread wrote as the instance joined, which no
+        // lease renews: it says that the instance left, for whoever reads it.
+        if !self.liveness.renews_record()
+            && let Err(e) = self.registry.deregister().await
+        {
+            tracing::warn!("cluster: rewriting this instance's record as it leaves failed: {e}");
+        }
+        left
     }
 
     /// Live peers' records, as the bucket lists them now.
@@ -523,7 +543,14 @@ impl Cluster {
     pub async fn join(&self) -> Result<()> {
         let probe = format!("nodes/{}.probe", self.node());
         check_conditional_writes(&self.bucket, &probe).await?;
-        self.lessee.take_lease().await?;
+        let machine = self.lessee.take_lease().await?;
+        // Its record, which no lease renews, once the provider's lease of its
+        // machine names it, so that a peer that finds the record finds it
+        // live: `Registry::scan`.
+        if !self.liveness.renews_record() {
+            self.registry.set_machine(machine);
+            self.registry.publish().await?;
+        }
         self.registered.set(Some(now_ms()));
         self.keep_lease();
         Ok(())
