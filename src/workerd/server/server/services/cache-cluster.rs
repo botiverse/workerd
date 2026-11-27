@@ -83,7 +83,7 @@ struct Shared {
     /// Held while `dir` is in use, so that other nodes leave it be.
     _lock: File,
     start: Instant,
-    /// The protocol's, divided as the lease's.
+    /// The protocol's, divided or set as the lease's.
     timing: Timing,
     cache: RefCell<Cache<Value>>,
     /// This node's operations, awaiting what they came to.
@@ -102,11 +102,17 @@ pub fn store(
     factory: &Rc<Factory>,
 ) -> Result<Clustered> {
     let me = node.cluster.node();
-    let Some(timing) = Timing::divided(node.time_divisor) else {
-        return Err(kj::failed!(
-            "cluster: unsafeTimeDivisor {} rounds a cache time down to 0 ms",
-            node.time_divisor
-        ));
+    // A config sets the lease's times, or divides them: never both (`lease_timing`).
+    let timing = if node.time_divisor == 1 {
+        Timing::for_lease(&node.timing)
+    } else {
+        let Some(timing) = Timing::divided(node.time_divisor) else {
+            return Err(kj::failed!(
+                "cluster: unsafeTimeDivisor {} rounds a cache time down to 0 ms",
+                node.time_divisor
+            ));
+        };
+        timing
     };
     let (dir, lock) = claim(root, me).map_err(|e| io_kj_error(&e))?;
     node.leave_wait_ms.set(timing.lease_wait_ms());

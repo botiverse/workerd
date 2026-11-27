@@ -330,6 +330,40 @@ struct ClusterConfig {
   # `stopTimeoutMs` is not divided. A divisor of 0, or one that rounds a time down to 0 (above
   # 1000), fails the config. Bucket requests that stall past the shortened bounds fence the
   # instance, so leave this at 1 outside tests.
+
+  leaseMs @8 :UInt32 = 0;
+  renewIntervalMs @9 :UInt32 = 0;
+  listIntervalMs @10 :UInt32 = 0;
+  # The instance's lease in the bucket, how often it renews it (a conditional write of its record),
+  # and how often it lists its peers (a list of the records and a read of each), in milliseconds.
+  # 0, the default, is the built-in time: a 20-second lease renewed every 3 seconds, and peers
+  # listed as often as the lease is renewed. On a bucket that bills each request, a longer lease
+  # renewed and listed less often costs less, and is slower to recover from a crash:
+  #
+  # - An instance that dies without stopping (a crash, a kill, a lost machine) keeps its Durable
+  #   Objects until its lease expires, up to `leaseMs` after its last renewal. Requests for them
+  #   fail or wait until then; then a peer takes each over at its next request. A stopping
+  #   instance hands its objects off first, which these times do not change.
+  # - A dead instance's alarms are adopted once a listing finds its lease expired, up to
+  #   `listIntervalMs` and five seconds after that.
+  # - A new instance is routed to once its peers list it, up to `listIntervalMs` after it joined.
+  # - An instance rides out bucket trouble (renewals that fail or stall) for up to `leaseMs` less
+  #   `renewIntervalMs` and 8 seconds before it fences; about 9 seconds with the built-in times.
+  #   A failed renewal is retried every second.
+  # - The watchdog that fences an instance whose event loop makes no progress waits the larger of
+  #   60 seconds and three leases.
+  #
+  # `leaseMs` is 10000 to 120000, and each interval is 1000 to 60000. `leaseMs` must be at least
+  # three times `renewIntervalMs` and more than `renewIntervalMs` plus 8000 (a renewal's 4-second
+  # bound and the 4 seconds the instance fences before its lease expires), and more than
+  # `renewIntervalMs`, `listIntervalMs` and 2000 (a listing's bound) together, so that a live
+  # peer's record still holds at the next listing. Otherwise the config fails. For example,
+  # `leaseMs = 60000, renewIntervalMs = 10000, listIntervalMs = 30000` makes a fifth as many
+  # renewals and listings as the built-in times. Every instance of a cluster should use the same
+  # times: peers judge an instance's lease by the expiry its record names, but the clustered Cache
+  # API's guarantees assume that every peer lists as often as this instance does (a joining
+  # instance waits longer when listings are further apart). Cannot be combined with
+  # `unsafeTimeDivisor`.
 }
 
 struct TracingOptions {

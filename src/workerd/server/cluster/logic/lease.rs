@@ -24,6 +24,11 @@ pub struct Timing {
     /// lease holds. R2 stalls writes ~5.5 s at every 5-minute mark; a 2 s
     /// bound cancelled them and fenced every node.
     pub interval_ms: u64,
+    /// How often the peers are listed: a LIST of the node records and a
+    /// read of each. A listing that comes late only delays routing to a
+    /// new peer and adopting a dead one's alarms; a peer's record read in
+    /// the meantime stands in for it while its lease holds.
+    pub list_interval_ms: u64,
     pub renew_timeout_ms: u64,
     pub list_timeout_ms: u64,
     pub retry_ms: u64,
@@ -78,6 +83,7 @@ impl Timing {
     pub const DEFAULT: Self = Self {
         lease_ms: 20_000,
         interval_ms: 3_000,
+        list_interval_ms: 3_000,
         renew_timeout_ms: 4_000,
         list_timeout_ms: 2_000,
         retry_ms: 1_000,
@@ -98,6 +104,7 @@ impl Timing {
         let divided = Self {
             lease_ms: t.lease_ms.checked_div(divisor)?,
             interval_ms: t.interval_ms / divisor,
+            list_interval_ms: t.list_interval_ms / divisor,
             renew_timeout_ms: t.renew_timeout_ms / divisor,
             list_timeout_ms: t.list_timeout_ms / divisor,
             retry_ms: t.retry_ms / divisor,
@@ -110,10 +117,69 @@ impl Timing {
         (!divided.times().contains(&0)).then_some(divided)
     }
 
-    const fn times(self) -> [u64; 10] {
+    /// `DEFAULT` with the lease, the rounds that renew it and the rounds
+    /// that list the peers set from the cluster's config, for a bucket that
+    /// bills each request: a longer lease renewed less often rides out
+    /// longer bucket trouble, and a crashed node's objects wait longer for a
+    /// peer to take them over. The bounds on a round are not changed. The
+    /// watchdog waits out at least three leases (`stall_ms`).
+    ///
+    /// Refused, saying why, unless a lease spans at least three renewals,
+    /// a round and the margin it fences with fit in it (`before_renew`),
+    /// and a peer's record, renewed a round before a listing, still holds
+    /// at the next listing's end, so that no live peer drops out of the
+    /// listed ones between listings.
+    pub fn configured(
+        lease_ms: u64,
+        interval_ms: u64,
+        list_interval_ms: u64,
+    ) -> Result<Self, String> {
+        let t = Self {
+            lease_ms,
+            interval_ms,
+            list_interval_ms,
+            stall_ms: Self::DEFAULT.stall_ms.max(lease_ms.saturating_mul(3)),
+            ..Self::DEFAULT
+        };
+        let within = |what: &str, ms: u64, (min, max): (u64, u64)| {
+            if (min..=max).contains(&ms) {
+                Ok(())
+            } else {
+                Err(format!("{what} {ms} is not within {min} to {max}"))
+            }
+        };
+        within("leaseMs", lease_ms, CONFIGURED_LEASE_MS)?;
+        within("renewIntervalMs", interval_ms, CONFIGURED_INTERVAL_MS)?;
+        within("listIntervalMs", list_interval_ms, CONFIGURED_INTERVAL_MS)?;
+        if interval_ms.saturating_mul(3) > lease_ms {
+            return Err(format!(
+                "leaseMs {lease_ms} is less than three renewIntervalMs ({interval_ms})"
+            ));
+        }
+        let round = interval_ms + t.renew_timeout_ms + t.safety_ms();
+        if round >= lease_ms {
+            return Err(format!(
+                "leaseMs {lease_ms} is not more than renewIntervalMs {interval_ms}, a renewal's \
+                 bound ({} ms) and the margin a node fences with ({} ms)",
+                t.renew_timeout_ms,
+                t.safety_ms()
+            ));
+        }
+        if interval_ms + list_interval_ms + t.list_timeout_ms >= lease_ms {
+            return Err(format!(
+                "leaseMs {lease_ms} is not more than renewIntervalMs {interval_ms}, \
+                 listIntervalMs {list_interval_ms} and a listing's bound ({} ms)",
+                t.list_timeout_ms
+            ));
+        }
+        Ok(t)
+    }
+
+    const fn times(self) -> [u64; 11] {
         [
             self.lease_ms,
             self.interval_ms,
+            self.list_interval_ms,
             self.renew_timeout_ms,
             self.list_timeout_ms,
             self.retry_ms,
@@ -153,6 +219,15 @@ impl Timing {
         until_ms.saturating_sub(self.safety_ms())
     }
 }
+
+/// The leases `Timing::configured` accepts, in ms: from half the default,
+/// which still rides out a few seconds of bucket trouble, to two minutes.
+/// A node fences `safety_ms` before its lease expires, which covers clocks
+/// that drift apart by up to about 2% of a lease while it runs (the 1%
+/// either way that `cache-test.rs` simulates) only up to about 3 minutes.
+pub const CONFIGURED_LEASE_MS: (u64, u64) = (10_000, 120_000);
+/// The renewal and listing intervals `Timing::configured` accepts, in ms.
+pub const CONFIGURED_INTERVAL_MS: (u64, u64) = (1_000, 60_000);
 
 impl Default for Timing {
     fn default() -> Self {

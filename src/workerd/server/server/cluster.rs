@@ -76,6 +76,8 @@ pub struct ClusterNode {
     pub cluster: Rc<Cluster>,
     /// `unsafeTimeDivisor`: what the lease's times are divided by.
     pub time_divisor: u64,
+    /// The lease's times: divided, or as `leaseMs`, `renewIntervalMs` and `listIntervalMs` set.
+    pub timing: Timing,
     factory: Rc<Factory>,
     /// One session per peer instance at its address, dropped when it disconnects. A peer that
     /// vanishes without its session noticing keeps its entry for the life of the process.
@@ -490,6 +492,32 @@ fn fence_log_wait(remaining: Duration) -> Option<Duration> {
     (!wait.is_zero()).then_some(wait)
 }
 
+/// The lease's times for a config's `unsafeTimeDivisor`, `leaseMs`, `renewIntervalMs` and
+/// `listIntervalMs`, each of the last three 0 when not set: the default, divided by the divisor, or
+/// as set, `listIntervalMs` the renewals' unless it is set too.
+fn lease_timing(
+    divisor: u32,
+    lease_ms: u32,
+    renew_ms: u32,
+    list_ms: u32,
+) -> std::result::Result<Timing, String> {
+    if lease_ms == 0 && renew_ms == 0 && list_ms == 0 {
+        return Timing::divided(divisor.into()).ok_or_else(|| {
+            format!("unsafeTimeDivisor {divisor} rounds a lease time down to 0 ms")
+        });
+    }
+    if divisor != 1 {
+        return Err(format!(
+            "unsafeTimeDivisor {divisor} cannot be combined with leaseMs, renewIntervalMs or \
+             listIntervalMs"
+        ));
+    }
+    let set = |ms: u32, default: u64| if ms == 0 { default } else { u64::from(ms) };
+    let lease = set(lease_ms, Timing::DEFAULT.lease_ms);
+    let renew = set(renew_ms, Timing::DEFAULT.interval_ms);
+    Timing::configured(lease, renew, set(list_ms, renew))
+}
+
 impl ClusterNode {
     /// Joins the cluster: the crate's state for `conf`, this instance at `address`.
     pub fn new(
@@ -499,11 +527,13 @@ impl ClusterNode {
     ) -> Result<Rc<Self>> {
         let options = conf.get_bucket_options().map_err(|e| capnp(&e))?;
         let divisor = conf.get_unsafe_time_divisor();
-        let Some(timing) = Timing::divided(divisor.into()) else {
-            return Err(kj::failed!(
-                "cluster: unsafeTimeDivisor {divisor} rounds a lease time down to 0 ms"
-            ));
-        };
+        let timing = lease_timing(
+            divisor,
+            conf.get_lease_ms(),
+            conf.get_renew_interval_ms(),
+            conf.get_list_interval_ms(),
+        )
+        .map_err(|e| kj::failed!("cluster: {e}"))?;
         let setup = cluster::Setup {
             url: text(conf.get_bucket())?,
             options: options.iter().map(text).collect::<Result<_>>()?,
@@ -543,6 +573,7 @@ impl ClusterNode {
         Ok(Rc::new(Self {
             cluster,
             time_divisor: divisor.into(),
+            timing,
             factory,
             sessions: Rc::default(),
             advertise: address,

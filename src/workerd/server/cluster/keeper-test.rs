@@ -26,6 +26,7 @@ fn timing(lease_ms: u64) -> Timing {
     Timing {
         lease_ms,
         interval_ms: 10,
+        list_interval_ms: 10,
         renew_timeout_ms: lease_ms / 2,
         list_timeout_ms: lease_ms / 2,
         retry_ms: 5,

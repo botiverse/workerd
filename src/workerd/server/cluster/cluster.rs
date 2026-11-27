@@ -457,7 +457,7 @@ impl Cluster {
         }
     }
 
-    /// Lists the peers every `Timing::interval_ms` until this instance
+    /// Lists the peers every `Timing::list_interval_ms` until this instance
     /// leaves the cluster. A stale listing only delays routing to a new
     /// peer, so the listing shares the loop with everything else, and its
     /// failure is logged, never fatal. Never returns.
@@ -472,7 +472,7 @@ impl Cluster {
                 Ok(Err(e)) => tracing::warn!("listing the cluster failed: {e}"),
                 Err(_) => tracing::warn!("listing the cluster timed out"),
             }
-            tokio::time::sleep(ms(timing.interval_ms)).await;
+            tokio::time::sleep(ms(timing.list_interval_ms)).await;
         }
     }
 

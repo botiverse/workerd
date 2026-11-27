@@ -28,7 +28,7 @@ const LEASE: u64 = L.lease_ms;
 /// `CACHE_DST_SAFETY` overrides it.
 const SAFETY: u64 = 2 * L.max_skew_ms;
 const RENEW: u64 = L.interval_ms;
-const LIST: u64 = L.interval_ms;
+const LIST: u64 = L.list_interval_ms;
 /// The bucket's clock at the simulation's start.
 const BASE: u64 = 1_000_000;
 /// How far a clock strays from its skew before it turns back.
@@ -627,23 +627,61 @@ impl Sim {
 
 #[test]
 fn timing_keeps_one_node_serving_a_key() {
+    keeps_one_node_serving_a_key(T, L);
+}
+
+/// What `timing_keeps_one_node_serving_a_key` checks, for the cache's
+/// timing `t` over the lease's `l`.
+fn keeps_one_node_serving_a_key(t: Timing, l: lease::Timing) {
+    let (lease, safety) = (l.lease_ms, 2 * l.max_skew_ms);
     // Real ms for `ms` on the slowest and the fastest clock.
     let (slow, fast) = (|ms: u64| ms * 1_000 / 990, |ms: u64| ms * 1_000 / 1_010);
     // A joined node is in every fresh view: `join_ms` on the fastest clock
     // outlasts a view's staleness on the slowest, with the listing's 1.5 s
     // and registration's 0.6 s.
-    assert!(fast(T.join_ms) > slow(T.stale_ms) + 2_100);
+    assert!(fast(t.join_ms) > slow(t.stale_ms) + 2_100, "{t:?}");
     // A node fences before its record expires.
-    assert!(fast(LEASE) > slow(LEASE - SAFETY));
+    assert!(fast(lease) > slow(lease - safety), "{l:?}");
     // A home waits out the longest a copy may be served.
-    assert!(fast(T.lease_wait_ms()) > slow(T.lease_ms));
+    assert!(fast(t.lease_wait_ms()) > slow(t.lease_ms), "{t:?}");
     // A fenced home's copies run out before its record expires, so before
     // the next home serves the key.
-    assert!(LEASE - slow(LEASE - SAFETY) > slow(T.lease_ms));
+    assert!(lease - slow(lease - safety) > slow(t.lease_ms), "{t:?}");
     // An old home lists a joining one, or goes stale, and stops serving the
     // key; its copies run out before the new home is active. Whatever the
     // listings' cadence, which is `maintain`'s in the code and `LIST` here.
-    assert!(fast(T.join_ms) > slow(T.stale_ms) + 2_100 + slow(T.lease_wait_ms()));
+    assert!(
+        fast(t.join_ms) > slow(t.stale_ms) + 2_100 + slow(t.lease_wait_ms()),
+        "{t:?}"
+    );
+    // A node whose bucket answers in time never goes stale.
+    let gap = 2 * l.list_timeout_ms + l.list_interval_ms + l.renew_timeout_ms;
+    assert!(t.stale_ms >= gap + 4_000, "{t:?} over {l:?}");
+    // A match or write may wait for a joining home.
+    assert!(t.timeout_ms > t.join_ms, "{t:?}");
+}
+
+#[test]
+fn the_default_lease_keeps_the_default_timing() {
+    assert_eq!(Timing::for_lease(&L), T);
+}
+
+#[test]
+fn a_configured_lease_keeps_one_node_serving_a_key() {
+    for (lease_ms, renew, list) in [
+        (20_000, 3_000, 3_000),
+        (60_000, 10_000, 30_000),
+        (60_000, 20_000, 20_000),
+        (120_000, 40_000, 60_000),
+        (10_000, 1_000, 1_000),
+    ] {
+        let l = lease::Timing::configured(lease_ms, renew, list).unwrap();
+        let t = Timing::for_lease(&l);
+        keeps_one_node_serving_a_key(t, l);
+        // Listings further apart leave views fresh for longer; never less
+        // than the default.
+        assert!(t.stale_ms >= T.stale_ms && t.join_ms >= T.join_ms, "{t:?}");
+    }
 }
 
 impl Sim {

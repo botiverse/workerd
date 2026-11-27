@@ -28,6 +28,7 @@ fn the_lease_holds_however_long_startup_takes_after_join() {
     let timing = Timing {
         lease_ms: 400,
         interval_ms: 10,
+        list_interval_ms: 10,
         renew_timeout_ms: 20,
         list_timeout_ms: 20,
         retry_ms: 5,

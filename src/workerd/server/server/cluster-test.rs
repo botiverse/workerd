@@ -205,3 +205,55 @@ fn a_fenced_instance_exits_while_its_lease_holds() {
     assert_eq!(fence_log_wait(ms(5)), None);
     assert_eq!(fence_log_wait(Duration::ZERO), None);
 }
+
+#[test]
+fn a_config_that_sets_no_lease_time_keeps_the_default_divided() {
+    assert_eq!(lease_timing(1, 0, 0, 0), Ok(Timing::DEFAULT));
+    assert_eq!(lease_timing(4, 0, 0, 0), Ok(Timing::divided(4).unwrap()));
+    assert!(
+        lease_timing(0, 0, 0, 0)
+            .unwrap_err()
+            .contains("unsafeTimeDivisor 0")
+    );
+}
+
+#[test]
+fn a_config_sets_the_lease_its_renewals_and_its_listings() {
+    let t = lease_timing(1, 60_000, 10_000, 30_000).unwrap();
+    assert_eq!(
+        (t.lease_ms, t.interval_ms, t.list_interval_ms),
+        (60_000, 10_000, 30_000)
+    );
+    // Listings follow the renewals unless set; what is not set is the default.
+    let t = lease_timing(1, 60_000, 10_000, 0).unwrap();
+    assert_eq!(
+        (t.lease_ms, t.interval_ms, t.list_interval_ms),
+        (60_000, 10_000, 10_000)
+    );
+    let t = lease_timing(1, 0, 0, 10_000).unwrap();
+    assert_eq!(
+        (t.lease_ms, t.interval_ms, t.list_interval_ms),
+        (20_000, 3_000, 10_000)
+    );
+    assert_eq!(lease_timing(1, 20_000, 3_000, 3_000), Ok(Timing::DEFAULT));
+}
+
+#[test]
+fn a_config_that_sets_lease_times_badly_fails() {
+    // A 30-second renewal in the default 20-second lease.
+    assert!(
+        lease_timing(1, 0, 30_000, 0)
+            .unwrap_err()
+            .contains("three renewIntervalMs")
+    );
+    assert!(
+        lease_timing(1, 0, 0, 20_000)
+            .unwrap_err()
+            .contains("a listing's bound")
+    );
+    assert!(
+        lease_timing(4, 60_000, 0, 0)
+            .unwrap_err()
+            .contains("cannot be combined")
+    );
+}

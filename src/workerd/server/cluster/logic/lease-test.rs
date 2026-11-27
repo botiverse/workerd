@@ -129,3 +129,109 @@ fn a_lease_holds_for_as_long_as_it_has_time_remaining() {
         }
     }
 }
+
+/// Leases a config may set: the default's, the shortest and the longest
+/// that the bounds allow, and some between.
+const CONFIGURED: [(u64, u64, u64); 6] = [
+    (20_000, 3_000, 3_000),
+    (60_000, 10_000, 30_000),
+    (60_000, 20_000, 20_000),
+    (30_000, 5_000, 10_000),
+    (10_000, 1_000, 1_000),
+    (120_000, 40_000, 60_000),
+];
+
+#[test]
+fn the_default_lease_configured_is_the_default() {
+    assert_eq!(
+        Timing::configured(20_000, 3_000, 3_000),
+        Ok(Timing::DEFAULT)
+    );
+}
+
+#[test]
+fn a_configured_lease_keeps_the_defaults_proportions() {
+    for (lease_ms, interval_ms, list_interval_ms) in CONFIGURED {
+        let t = Timing::configured(lease_ms, interval_ms, list_interval_ms).unwrap();
+        assert_eq!(
+            (t.lease_ms, t.interval_ms, t.list_interval_ms),
+            (lease_ms, interval_ms, list_interval_ms)
+        );
+        // What `divided_times_keep_their_proportions` checks.
+        let round = t.interval_ms + t.renew_timeout_ms;
+        assert!(round + t.safety_ms() < t.lease_ms, "{t:?}");
+        assert!(t.stall_ms >= 3 * t.lease_ms, "{t:?}");
+        assert!(4 * t.interval_ms < t.stall_ms, "{t:?}");
+        // A live peer, renewed a round before a listing, is still live in
+        // that listing when the next one returns.
+        let next = t.list_interval_ms + t.list_timeout_ms;
+        assert!(t.interval_ms + next < t.lease_ms, "{t:?}");
+        // The bounds on a round are the default's.
+        let d = Timing::DEFAULT;
+        assert_eq!(
+            (
+                t.renew_timeout_ms,
+                t.list_timeout_ms,
+                t.retry_ms,
+                t.max_skew_ms
+            ),
+            (
+                d.renew_timeout_ms,
+                d.list_timeout_ms,
+                d.retry_ms,
+                d.max_skew_ms
+            )
+        );
+    }
+}
+
+#[test]
+fn a_configured_lease_renews_retries_and_fences_as_the_default() {
+    for (lease_ms, interval_ms, list_interval_ms) in CONFIGURED {
+        let t = Timing::configured(lease_ms, interval_ms, list_interval_ms).unwrap();
+        let mut lease = Lease::new(t);
+        assert_eq!(lease.renewed(0, Ok(t.lease_ms)), Step::Renew);
+        // A failed renewal a round later is retried, not fenced.
+        assert!(matches!(
+            lease.renewed(t.interval_ms, Err("x".into())),
+            Step::Retry(_)
+        ));
+        let last = t.lease_ms - t.safety_ms() - t.renew_timeout_ms;
+        assert!(matches!(
+            lease.renewed(last, Err("x".into())),
+            Step::Fence(_)
+        ));
+        // A round's renewal that starts on time finds the lease holding.
+        assert_eq!(lease.before_renew(&seen(t.interval_ms)), Step::Renew);
+    }
+}
+
+#[test]
+fn a_configured_lease_out_of_bounds_is_refused() {
+    let refused = |lease_ms, interval_ms, list_interval_ms, why: &str| {
+        let e = Timing::configured(lease_ms, interval_ms, list_interval_ms).unwrap_err();
+        assert!(
+            e.contains(why),
+            "{lease_ms}/{interval_ms}/{list_interval_ms}: {e}"
+        );
+    };
+    refused(9_999, 1_000, 1_000, "leaseMs 9999 is not within");
+    refused(120_001, 3_000, 3_000, "leaseMs 120001 is not within");
+    refused(20_000, 999, 3_000, "renewIntervalMs 999 is not within");
+    refused(20_000, 0, 3_000, "renewIntervalMs 0 is not within");
+    refused(20_000, 3_000, 0, "listIntervalMs 0 is not within");
+    refused(
+        120_000,
+        60_001,
+        3_000,
+        "renewIntervalMs 60001 is not within",
+    );
+    refused(120_000, 3_000, 60_001, "listIntervalMs 60001 is not within");
+    // Fewer than three renewals in a lease.
+    refused(20_000, 7_000, 3_000, "less than three renewIntervalMs");
+    // Three renewals, but a round and the margin don't fit.
+    refused(12_000, 4_000, 1_000, "a renewal's bound");
+    // A listing too far from the next.
+    refused(60_000, 10_000, 48_000, "a listing's bound");
+    assert!(Timing::configured(60_000, 10_000, 47_999).is_ok());
+}

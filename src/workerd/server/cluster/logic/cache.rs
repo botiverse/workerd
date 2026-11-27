@@ -46,7 +46,7 @@ use crate::handoff::successor;
 use crate::handoff::weight;
 
 /// How fresh a view must be, how long writes wait, how long leases last.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     /// A view whose listing began longer ago than this is stale: the node
     /// serves nothing and starts no writes.
@@ -87,6 +87,24 @@ impl Timing {
         (divided.lease_ms > 0).then_some(divided)
     }
 
+    /// `DEFAULT` for a lease whose rounds are `lease`'s
+    /// (`lease::Timing::configured`): listings that come further apart
+    /// than the default's leave a view fresh for longer, and a joining node
+    /// waits that much longer, as do matches and writes. `DEFAULT` for the
+    /// default lease.
+    #[must_use]
+    pub fn for_lease(lease: &crate::lease::Timing) -> Self {
+        let t = Self::DEFAULT;
+        let stale_ms = t.stale_ms.max(listing_gap_ms(lease) + STALE_SLACK_MS);
+        let longer = stale_ms - t.stale_ms;
+        Self {
+            stale_ms,
+            join_ms: t.join_ms + longer,
+            timeout_ms: t.timeout_ms + longer,
+            lease_ms: t.lease_ms,
+        }
+    }
+
     /// Whether a view whose listing began at `listed` is fresh at `now`.
     #[must_use]
     pub fn fresh(&self, now: u64, listed: Option<u64>) -> bool {
@@ -121,13 +139,17 @@ impl Timing {
 }
 
 // `Cluster::maintain` renews (at most `renew_timeout_ms`), lists (at most
-// `list_timeout_ms`) and sleeps `interval_ms`, and a listing counts from its
-// start once it returns: a node whose bucket answers in time never goes
-// stale.
+// `list_timeout_ms`) and sleeps `list_interval_ms`, and a listing counts
+// from its start once it returns: a node whose bucket answers in time never
+// goes stale, as the longest gap between two listings' starts is this.
+// What a view's freshness leaves beyond it is for a busy event loop.
+const fn listing_gap_ms(l: &crate::lease::Timing) -> u64 {
+    2 * l.list_timeout_ms + l.list_interval_ms + l.renew_timeout_ms
+}
+const STALE_SLACK_MS: u64 = 4_000;
 const _: () = {
     let (t, l) = (Timing::DEFAULT, crate::lease::Timing::DEFAULT);
-    let gap = 2 * l.list_timeout_ms + l.interval_ms + l.renew_timeout_ms;
-    assert!(t.stale_ms >= gap + 4_000);
+    assert!(t.stale_ms >= listing_gap_ms(&l) + STALE_SLACK_MS);
 };
 
 /// A value's version: the home that stored it, and a count there.
