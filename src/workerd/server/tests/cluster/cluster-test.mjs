@@ -1758,11 +1758,13 @@ test('cluster: external liveness: no lease record is renewed, and a killed owner
         )
       );
     const before = await records();
+    // Held by its machine's lease: never expired to a reader without one.
+    const held = 2 ** 53 - 1;
     assert.deepStrictEqual(
       before.map((r) => [r.expires_ms, r.machine]),
       [
-        [0, 'm0'],
-        [0, 'm1'],
+        [held, 'm0'],
+        [held, 'm1'],
       ]
     );
     const first = await fetchJson(nodes[1].httpPort, '/increment?name=ext');
@@ -1821,7 +1823,7 @@ test('cluster: liveness both and external instances serve one cluster', async ()
       const a = await record(nodes[0]);
       assert(a.expires_ms > Date.now(), JSON.stringify(a));
       assert.strictEqual(a.machine, 'm0');
-      assert.strictEqual((await record(nodes[1])).expires_ms, 0);
+      assert.strictEqual((await record(nodes[1])).expires_ms, 2 ** 53 - 1);
       const counts = [];
       const owners = new Set();
       for (let i = 0; i < 6; i++) {

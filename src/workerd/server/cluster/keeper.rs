@@ -317,12 +317,20 @@ impl Keeper {
         if self.lease.borrow().left {
             return Step::Renew;
         }
-        self.granted(result)
+        // A provider that grants nothing (its lease lapsed, or this machine's
+        // clock is off the bucket's) says to stop now, not at the next round.
+        if let Ok((sent, deadline)) = result
+            && deadline <= sent
+        {
+            drop(self.granted(Ok(deadline)));
+            return Step::Fence("the liveness provider grants no lease".into());
+        }
+        self.granted(result.map(|(_, deadline)| deadline))
     }
 
-    /// A heartbeat, bounded as a renewal is: the grant's deadline, from when
-    /// it was sent, or why it failed.
-    async fn heartbeat(&self) -> std::result::Result<u64, String> {
+    /// A heartbeat, bounded as a renewal is: when it was sent and the grant's
+    /// deadline from then, or why it failed.
+    async fn heartbeat(&self) -> std::result::Result<(u64, u64), String> {
         let Some(agent) = &self.agent else {
             return Err("no liveness provider".into());
         };
@@ -334,7 +342,7 @@ impl Keeper {
         let sent = mono_ms();
         let beat = agent.heartbeat(self.registry.node(), progress, self.registry.draining());
         match timeout(ms(self.held.timing.renew_timeout_ms), beat).await {
-            Ok(Ok(grant)) => Ok(sent.saturating_add(grant.valid_for_ms)),
+            Ok(Ok(grant)) => Ok((sent, sent.saturating_add(grant.valid_for_ms))),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err("the liveness provider did not answer in time".into()),
         }
@@ -417,7 +425,7 @@ impl Keeper {
         }
         if self.agent.is_some() && !self.lease.borrow().left {
             match self.heartbeat().await {
-                Ok(deadline) => drop(self.granted(Ok(deadline))),
+                Ok((_, deadline)) => drop(self.granted(Ok(deadline))),
                 Err(e) => tracing::warn!("cluster: publishing the drain failed: {e}"),
             }
         }

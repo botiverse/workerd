@@ -24,6 +24,7 @@ use crate::Bucket;
 use crate::Registry;
 use crate::cluster::now_ms;
 use crate::keeper::Thread;
+use crate::registry::HELD_BY_MACHINE;
 
 /// What the fake provider answers.
 struct State {
@@ -386,8 +387,11 @@ fn with_both_a_peer_is_live_if_either_says_so() {
         let now = now_ms();
         let agent = Rc::new(Agent::new(socket));
         let registry = Registry::new(bucket.clone(), "a", "a:1", 20_000).with_agent(agent, true);
-        // An `external` peer: its record says 0, its machine's lease live.
-        record(&bucket, "b", 0, Some("m2")).await;
+        // An `external` peer: its record held by its machine's lease, live.
+        record(&bucket, "b", HELD_BY_MACHINE, Some("m2")).await;
+        // One whose machine's lease no longer lists it: dead, whatever its
+        // record says.
+        record(&bucket, "e", HELD_BY_MACHINE, Some("m2")).await;
         // A `bucket` peer, which no lease lists.
         record(&bucket, "c", now + 10_000, None).await;
         // A dead one.
@@ -402,7 +406,10 @@ fn with_both_a_peer_is_live_if_either_says_so() {
             .collect();
         live.sort();
         assert_eq!(live, ["b", "c"]);
-        assert_eq!(registry.dead(), ["d"]);
+        let mut dead = registry.dead();
+        dead.sort();
+        assert_eq!(dead, ["d", "e"]);
+        assert_eq!(registry.live_now("e", now).await.unwrap(), None);
         assert!(registry.live_now("b", now).await.unwrap().is_some());
         assert!(registry.live_now("c", now).await.unwrap().is_some());
         assert_eq!(registry.live_now("d", now).await.unwrap(), None);
@@ -476,12 +483,100 @@ fn an_external_instance_publishes_a_static_record() {
         let joined = read(bucket.clone()).await;
         assert_eq!(
             (joined.expires_ms, joined.machine.as_deref()),
-            (0, Some("m1"))
+            (HELD_BY_MACHINE, Some("m1"))
         );
         assert!(!joined.draining);
         registry.deregister().await.unwrap();
         let left = read(bucket.clone()).await;
         assert!(left.draining);
+        assert_eq!(left.expires_ms, 0);
         assert_eq!(left.machine.as_deref(), Some("m1"));
     });
+}
+
+#[test]
+fn a_reader_without_a_provider_never_takes_a_machine_held_instance_for_dead() {
+    run(async {
+        let bucket = Bucket::memory("");
+        let now = now_ms();
+        let registry = Registry::new(bucket.clone(), "a", "a:1", 1_000);
+        record(&bucket, "b", HELD_BY_MACHINE, Some("m2")).await;
+        // Live: nothing here can tell its machine's lease ran out, so its
+        // objects wait rather than move from a live owner.
+        assert!(registry.live_now("b", now).await.unwrap().is_some());
+        // Nor is its record deleted, however old.
+        let much_later = now + 100 * 1_000;
+        registry.peers(much_later).await.unwrap();
+        assert!(bucket.get("nodes/b.json").await.unwrap().is_some());
+        // Left: its rewritten record is dead to every reader.
+        record(&bucket, "b", 0, Some("m2")).await;
+        assert_eq!(registry.live_now("b", now).await.unwrap(), None);
+    });
+}
+
+#[test]
+fn a_stale_view_judges_no_one_dead() {
+    let (socket, fake) = provider(300);
+    run(async {
+        let bucket = Bucket::memory("");
+        let ttl = 1_000;
+        let agent = Rc::new(Agent::new(socket));
+        let registry = Registry::new(bucket.clone(), "a", "a:1", ttl).with_agent(agent, false);
+        let now = now_ms();
+        fake.set(|s| {
+            s.instances = vec![
+                instance("a", "m1", now + 10_000),
+                instance("b", "m2", now + 600),
+            ]
+        });
+        record(&bucket, "b", HELD_BY_MACHINE, Some("m2")).await;
+        registry.peers(now).await.unwrap();
+        assert!(registry.dead().is_empty());
+        // The provider has read nothing for a while: m2's lease, as it last
+        // read it, ran out by now. b is not listed, but neither dead nor its
+        // record deleted, however long.
+        fake.set(|s| s.age_ms = ttl);
+        let later = now + 20 * ttl;
+        registry.peers(later).await.unwrap();
+        assert!(!registry.listed_live("b", later));
+        assert!(registry.dead().is_empty());
+        assert!(bucket.get("nodes/b.json").await.unwrap().is_some());
+        // A fresh view without it: dead.
+        fake.set(|s| {
+            s.age_ms = 0;
+            s.instances.truncate(1);
+        });
+        registry.peers(later).await.unwrap();
+        assert_eq!(registry.dead(), ["b"]);
+    });
+}
+
+#[test]
+fn a_provider_that_grants_nothing_fences_at_once() {
+    // Well over a renewal's bound (half the lease) left at every round.
+    let (socket, fake) = provider(3_500);
+    let (thread, fences) = lease_thread(Liveness::External(socket), timing(4_000));
+    block_on(thread.take_lease()).unwrap();
+    thread.maintain();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(fences.try_recv().is_err());
+    // A clock off the bucket's, say: the grant is 0, though 3 s were left.
+    fake.set(|s| s.valid_for_ms = Some(0));
+    let zeroed = mono_ms();
+    let (reason, at) = fences.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(at - zeroed < 200, "fenced {} ms later", at - zeroed);
+    assert!(reason.contains("grants no lease"), "{reason}");
+    assert!(!thread.held().holds(now_ms()));
+}
+
+#[test]
+fn the_grant_clock_counts_time_suspended() {
+    // `CLOCK_BOOTTIME`, not `Instant`: equal to it while nothing suspends.
+    let (a, i) = (mono_ms(), std::time::Instant::now());
+    std::thread::sleep(Duration::from_millis(50));
+    let elapsed = mono_ms() - a;
+    assert!(
+        elapsed >= 49 && elapsed <= i.elapsed().as_millis() as u64 + 2,
+        "{elapsed}"
+    );
 }

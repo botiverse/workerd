@@ -45,8 +45,8 @@ pub struct NodeRecord {
     pub write: u64,
     /// The machine whose lease keeps the instance live, when a liveness
     /// provider does (`agent::Liveness`): the record of an instance that
-    /// renews none of its own (`External`) says `expires_ms` 0, and readers
-    /// ask the provider instead. Readers that keep their own leases never
+    /// renews none of its own (`External`) says `expires_ms`
+    /// [`HELD_BY_MACHINE`], and readers with a provider ask it instead. Readers that keep their own leases never
     /// delete such a record. Older processes write none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
@@ -208,11 +208,11 @@ impl Registry {
     }
 
     /// The record of an instance whose liveness provider alone keeps it live
-    /// (`Liveness::External`), written once, as it joins: `expires_ms` 0 and
-    /// its machine. Peers find it by scanning `nodes/`, for its alarms once it
+    /// (`Liveness::External`), written once, as it joins: `expires_ms`
+    /// [`HELD_BY_MACHINE`] and its machine. Peers find it by scanning `nodes/`, for its alarms once it
     /// is dead; `deregister` rewrites it as it leaves.
     pub async fn publish(&self) -> Result<()> {
-        self.write_own(0).await
+        self.write_own(HELD_BY_MACHINE).await
     }
 
     /// Writes this instance's record, as `renew` describes.
@@ -424,8 +424,12 @@ impl Registry {
             self.bucket.delete(&node_key(node)).await?;
         }
         // A record a machine's lease backs, read by an instance whose
-        // provider alone says who lives: the provider already said.
-        let backed = self.external() && record.machine.is_some();
+        // provider alone says who lives: the provider already said. With
+        // both, a record that no lease of its own renews is the provider's
+        // to judge too. Without a provider, `HELD_BY_MACHINE` keeps it live:
+        // nothing here can tell whether its machine's lease holds.
+        let backed = record.machine.is_some()
+            && (self.external() || (self.both && record.expires_ms == HELD_BY_MACHINE));
         if record.expires_ms <= now_ms || backed {
             self.listed.borrow_mut().remove(node);
             return Ok(None);
@@ -510,14 +514,21 @@ impl Registry {
             .filter(|record| record.expires_ms > now_ms)
             .collect();
         let live: HashSet<String> = peers.iter().map(|p| p.node.clone()).collect();
-        let left = self.viewed.borrow().iter().any(|node| !live.contains(node));
         self.seen.borrow_mut().extend(live.iter().cloned());
-        *self.viewed.borrow_mut() = live.clone();
+        // A view older than half a lease may have lost live instances to its
+        // age alone (their machines' leases expired in it, not in the
+        // bucket): absence from it proves no death, so it starts no scan and
+        // ends no instance's place in the last fresh one.
+        let fresh = view.age_ms < self.ttl_ms / 2;
+        let left = fresh && self.viewed.borrow().iter().any(|node| !live.contains(node));
+        if fresh {
+            *self.viewed.borrow_mut() = live.clone();
+        }
         let due = self
             .scanned_ms
             .get()
             .is_none_or(|at| now_ms >= at + SCAN_LEASES * self.ttl_ms);
-        if left || due {
+        if fresh && (left || due) {
             match self.scan(&live, listed_ms, now_ms).await {
                 Ok(()) => self.scanned_ms.set(Some(now_ms)),
                 Err(e) => tracing::warn!("cluster: scanning the instance records failed: {e}"),
@@ -567,7 +578,12 @@ impl Registry {
                 continue;
             }
             dead.push(node.to_owned());
-            let expired = record.expires_ms.max(entry.modified_ms);
+            // A record a machine's lease backs says nothing by its expiry.
+            let expired = if record.machine.is_some() {
+                entry.modified_ms
+            } else {
+                record.expires_ms.max(entry.modified_ms)
+            };
             if expired + DEAD_RECORD_TTLS * self.ttl_ms < now_ms
                 && self
                     .bucket
@@ -631,6 +647,14 @@ impl Registry {
         self.dead.borrow().clone()
     }
 }
+
+/// The `expires_ms` of an instance whose machine's lease keeps it live
+/// (`Liveness::External`): never, to a reader that judges records by their
+/// own expiry, as an older workerd or one in `bucket` mode does. Such a reader
+/// never takes the instance's objects over, which only waits; were it 0, it
+/// would take them over from a live instance. 2^53 - 1: no reader's sum
+/// overflows, and JavaScript reads it exactly. Rewritten to 0 as it leaves.
+pub const HELD_BY_MACHINE: u64 = (1 << 53) - 1;
 
 /// How many lease lifetimes past its expiry a node record is deleted.
 const DEAD_RECORD_TTLS: u64 = 10;

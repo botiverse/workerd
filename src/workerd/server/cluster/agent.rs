@@ -402,14 +402,47 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Milliseconds on this process's monotonic clock, from 1: a grant's deadline
-/// is on it, never on the wall clock, which may step.
+/// Milliseconds on this machine's boot-time clock, from 1: a grant's deadline
+/// is on it, never on the wall clock, which may step. Not on `Instant`
+/// (`CLOCK_MONOTONIC`), which stands still while the machine is suspended:
+/// peers' clocks do not, and a grant must not outlast a suspension that
+/// outlasted it.
 pub fn mono_ms() -> u64 {
+    static START: OnceLock<u64> = OnceLock::new();
+    let start = *START.get_or_init(boot_ms);
+    boot_ms().saturating_sub(start).saturating_add(1)
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "clock_gettime(CLOCK_BOOTTIME): std's clocks stand still in suspend"
+)]
+fn boot_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec for the call to write.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut ts) };
+    if r != 0 {
+        return instant_ms();
+    }
+    let secs = u64::try_from(ts.tv_sec).unwrap_or_default();
+    let nanos = u64::try_from(ts.tv_nsec).unwrap_or_default();
+    secs.saturating_mul(1000).saturating_add(nanos / 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boot_ms() -> u64 {
+    instant_ms()
+}
+
+/// `Instant`'s milliseconds since the first call: where no boot-time clock is.
+fn instant_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    u64::try_from(start.elapsed().as_millis())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
